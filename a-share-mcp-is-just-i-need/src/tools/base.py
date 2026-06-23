@@ -11,7 +11,6 @@ from src.data_source_interface import NoDataFoundError, LoginError, DataSourceEr
 
 logger = logging.getLogger(__name__)
 
-
 def safe_data_source_call(
     tool_name: str,
     data_source_method: Callable,

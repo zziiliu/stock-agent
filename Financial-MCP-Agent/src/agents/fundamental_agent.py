@@ -104,6 +104,24 @@ async def fundamental_agent(state: AgentState) -> AgentState:
         logger.info(f"{WAIT_ICON} FundamentalAgent: Fetching MCP tools...")
         try:
             mcp_tools = await get_mcp_tools()
+            allowed_tool_names = {
+                "get_stock_basic_info",
+                "get_stock_industry",
+                "get_profit_data",
+                "get_operation_data",
+                "get_growth_data",
+                "get_balance_data",
+                "get_cash_flow_data",
+                "get_dupont_data",
+                "get_dividend_data",
+                "get_performance_express_report",
+                "get_forecast_report",
+            }
+
+            mcp_tools = [
+                tool for tool in mcp_tools
+                if tool.name in allowed_tool_names
+            ]
             if not mcp_tools:
                 logger.error(
                     f"{ERROR_ICON} FundamentalAgent: No MCP tools available.")
@@ -151,7 +169,7 @@ async def fundamental_agent(state: AgentState) -> AgentState:
 
 重要限制：请专注于财务数据和基本面指标分析，不要使用crawl_news工具获取新闻信息。基本面分析应该基于财务报表、财务指标和公司基本面数据，而不是新闻事件。
 
-请使用可用的工具获取实际数据进行分析，而不是基于假设。如果某些数据无法获取，请尝试使用不同的时间周期或其他工具组合，基于可用信息提供尽可能全面的分析。"""
+请使用可用的工具获取实际数据进行分析，而不是基于假设。如果某些数据无法获取，最多再调用3次工具。若某个工具没有返回有效数据，不要反复更换年份、季度或参数重试，直接说明该项数据暂缺，或者其他问题。只要已经获得公司基本信息、行业信息、盈利能力、成长能力、资产负债、现金流中的至少三类数据，就停止调用工具并输出分析。"""
 
             logger.info(f"Agent input: {agent_input}")
 
@@ -166,7 +184,53 @@ async def fundamental_agent(state: AgentState) -> AgentState:
             }
 
             # 调用 Agent执行分析
-            response = await agent.ainvoke(input_data)
+            # response = await agent.ainvoke(input_data)
+
+
+            # 调用 Agent执行分析：调试版，边执行边打印工具调用
+            response = None
+            tool_call_count = 0
+            seen_message_ids = set()
+
+            async for chunk in agent.astream(
+                input_data,
+                config={"recursion_limit": 50},
+                stream_mode="values"
+            ):
+                response = chunk
+
+                messages = chunk.get("messages", [])
+
+                for msg in messages:
+                    msg_id = getattr(msg, "id", None) or id(msg)
+                    if msg_id in seen_message_ids:
+                        continue
+                    seen_message_ids.add(msg_id)
+
+                    # 打印 AI 发起的工具调用
+                    if isinstance(msg, AIMessage):
+                        tool_calls = getattr(msg, "tool_calls", None)
+                        if tool_calls:
+                            for call in tool_calls:
+                                tool_call_count += 1
+                                tool_name = call.get("name", "UNKNOWN")
+                                tool_args = call.get("args", {})
+
+                                print(f"\n[TOOL CALL #{tool_call_count}] {tool_name}")
+                                print(f"[ARGS] {tool_args}")
+
+                # 打印工具返回
+                    if type(msg).__name__ == "ToolMessage":
+                        tool_name = getattr(msg, "name", "UNKNOWN")
+                        content = getattr(msg, "content", "")
+                        content_text = str(content)
+                        preview = content_text[:500].replace("\n", " ")
+                        print(f"[TOOL RESULT] {tool_name}, len={len(content_text)}, preview={preview}")
+            print(f"\nTotal tool calls: {tool_call_count}")
+
+
+
+
 
             end_time = time.time()
             execution_time = end_time - start_time

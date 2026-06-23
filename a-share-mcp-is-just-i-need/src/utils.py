@@ -110,6 +110,7 @@ def fetch_financial_data(
     try:
         # 使用登录上下文管理器确保API连接正常
         with baostock_login_context():
+            logger.info(f"[TRACE] bs_query_func={bs_query_func}, data_type={data_type_name}")
             # 调用传入的Baostock查询函数，所有财务数据函数都使用相同的参数格式
             rs = bs_query_func(code=code, year=year, quarter=quarter, **kwargs)
 
