@@ -8,7 +8,7 @@ SERVER_CONFIGS = {
         "args": [
             "run",  
             "--directory",
-            r"D:/juliye/toy/gupiao/Finance/a-share-mcp-is-just-i-need",  # 修改为本机的服务器项目路径
+            r"/Users/mac/Finance/stock-agent/a-share-mcp-is-just-i-need",  # 修改为本机的服务器项目路径
             "python",  #
             "mcp_server.py"  # MCP服务器脚本
         ],
