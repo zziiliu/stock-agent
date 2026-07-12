@@ -8,7 +8,8 @@ import io
 from contextlib import contextmanager, redirect_stdout
 from typing import List, Optional, Callable, Any
 from .data_source_interface import LoginError, DataSourceError, NoDataFoundError
-
+import threading
+BAOSTOCK_LOCK = threading.RLock()
 # --- 日志设置 ---
 def setup_logging(level=logging.INFO):
     """配置应用程序的基本日志记录"""
@@ -31,52 +32,67 @@ def baostock_login_context():
     
     使用 contextlib.redirect_stdout 来抑制输出，这是跨平台兼容的方法
     """
-    # 使用 StringIO 来捕获输出，避免在 Windows 上使用文件描述符操作
-    f = io.StringIO()
-    
-    try:
-        # 重定向标准输出以抑制登录消息
-        logger.debug("Attempting Baostock login...")
-        with redirect_stdout(f):
-            lg = bs.login()
-        logger.debug(f"Login result: code={lg.error_code}, msg={lg.error_msg}")
-
-        if lg.error_code != '0':
-            # 在抛出异常前记录错误
-            logger.error(f"Baostock login failed: {lg.error_msg}")
-            raise LoginError(f"Baostock login failed: {lg.error_msg}")
-
-        logger.info("Baostock login successful.")
+    with BAOSTOCK_LOCK:
+        trace_to_file("[TRACE] enter baostock_login_context")
+        logger.info("[BAOSTOCK_LOCK] acquired")
+        # 使用 StringIO 来捕获输出，避免在 Windows 上使用文件描述符操作
+        f = io.StringIO()
         
         try:
-            yield  # API调用在这里进行
-        finally:
-            # 重定向标准输出以进行登出
-            logger.debug("Attempting Baostock logout...")
+            # 重定向标准输出以抑制登录消息
+            logger.debug("Attempting Baostock login...")
             with redirect_stdout(f):
-                bs.logout()
-            logger.debug("Logout completed.")
-            logger.info("Baostock logout successful.")
-    except (OSError, IOError) as e:
-        # 如果重定向失败，尝试不使用重定向直接调用（作为后备方案）
-        logger.warning(f"Failed to redirect stdout, trying direct call: {e}")
-        try:
-            lg = bs.login()
+                lg = bs.login()
+            logger.debug(f"Login result: code={lg.error_code}, msg={lg.error_msg}")
+
             if lg.error_code != '0':
+                # 在抛出异常前记录错误
                 logger.error(f"Baostock login failed: {lg.error_msg}")
                 raise LoginError(f"Baostock login failed: {lg.error_msg}")
-            logger.info("Baostock login successful (direct call).")
+
+            logger.info("Baostock login successful.")
+            
             try:
-                yield
+                yield  # API调用在这里进行
             finally:
-                bs.logout()
-                logger.info("Baostock logout successful (direct call).")
-        except Exception as inner_e:
-            logger.error(f"Error in direct Baostock call: {inner_e}")
-            raise
+                # 重定向标准输出以进行登出
+                logger.debug("Attempting Baostock logout...")
+                with redirect_stdout(f):
+                    bs.logout()
+                logger.debug("Logout completed.")
+                logger.info("Baostock logout successful.")
+        except (OSError, IOError) as e:
+            # 如果重定向失败，尝试不使用重定向直接调用（作为后备方案）
+            logger.warning(f"Failed to redirect stdout, trying direct call: {e}")
+            try:
+                lg = bs.login()
+                if lg.error_code != '0':
+                    logger.error(f"Baostock login failed: {lg.error_msg}")
+                    raise LoginError(f"Baostock login failed: {lg.error_msg}")
+                logger.info("Baostock login successful (direct call).")
+                try:
+                    yield
+                finally:
+                    bs.logout()
+                    logger.info("Baostock logout successful (direct call).")
+            except Exception as inner_e:
+                logger.error(f"Error in direct Baostock call: {inner_e}")
+                raise
 
 # --- 通用数据获取函数 ---
-
+def trace_to_file(msg: str):
+    with open(
+        r"D:\juliye\toy\gupiao\Finance\baostock_trace.log",
+        "a",
+        encoding="utf-8"
+    ) as f:
+        f.write(
+            f"[pid={os.getpid()}] "
+            f"[ppid={os.getppid()}] "
+            f"[thread={threading.get_ident()}] "
+            f"[lock={id(BAOSTOCK_LOCK)}] "
+            f"{msg}\n"
+        )
 def fetch_financial_data(
     bs_query_func: Callable,
     data_type_name: str,
@@ -110,7 +126,7 @@ def fetch_financial_data(
     try:
         # 使用登录上下文管理器确保API连接正常
         with baostock_login_context():
-            logger.info(f"[TRACE] bs_query_func={bs_query_func}, data_type={data_type_name}")
+            trace_to_file(f"[TRACE] bs_query_func={bs_query_func}, data_type={data_type_name}, code={code}, year={year}, quarter={quarter}")
             # 调用传入的Baostock查询函数，所有财务数据函数都使用相同的参数格式
             rs = bs_query_func(code=code, year=year, quarter=quarter, **kwargs)
 

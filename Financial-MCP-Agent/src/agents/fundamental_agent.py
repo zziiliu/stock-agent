@@ -100,10 +100,12 @@ async def fundamental_agent(state: AgentState) -> AgentState:
             max_tokens=6000   # 增加token数量用于详细分析
         )
 
-        # 2. 获取MCP工具集
-        logger.info(f"{WAIT_ICON} FundamentalAgent: Fetching MCP tools...")
+         # 2. 获取 MCP 工具集
+        logger.info(
+            f"{WAIT_ICON} FundamentalAgent: Fetching MCP tools..."
+        )
+
         try:
-            mcp_tools = await get_mcp_tools()
             allowed_tool_names = {
                 "get_stock_basic_info",
                 "get_stock_industry",
@@ -118,41 +120,90 @@ async def fundamental_agent(state: AgentState) -> AgentState:
                 "get_forecast_report",
             }
 
-            mcp_tools = [
-                tool for tool in mcp_tools
-                if tool.name in allowed_tool_names
-            ]
-            if not mcp_tools:
-                logger.error(
-                    f"{ERROR_ICON} FundamentalAgent: No MCP tools available.")
-                current_data["fundamental_analysis_error"] = "No MCP tools available."
+            # get_mcp_tools() 现在是异步上下文管理器。
+            # 整个 ReAct Agent 执行期间都会复用同一个 MCP session
+            # 和同一个 stdio MCP Server 子进程。
+            async with get_mcp_tools() as all_mcp_tools:
 
-                # 记录 Agent执行失败
-                execution_logger.log_agent_complete(agent_name, current_data, time.time(
-                ) - agent_start_time, False, "No MCP tools available")
+                # 只保留基本面 Agent 所需的工具
+                mcp_tools = [
+                    tool
+                    for tool in all_mcp_tools
+                    if tool.name in allowed_tool_names
+                ]
 
-                return {"data": current_data, "messages": current_messages, "metadata": current_metadata}
+                if not mcp_tools:
+                    logger.error(
+                        f"{ERROR_ICON} "
+                        f"FundamentalAgent: No MCP tools available."
+                    )
 
-            logger.info(
-                f"{SUCCESS_ICON} FundamentalAgent: Successfully loaded {len(mcp_tools)} tools.")
+                    current_data[
+                        "fundamental_analysis_error"
+                    ] = "No MCP tools available."
 
-            # 打印可用工具列表，便于调试
-            tool_names = [tool.name for tool in mcp_tools]
-            logger.info(f"Available tools: {tool_names}")
+                    execution_logger.log_agent_complete(
+                        agent_name,
+                        current_data,
+                        time.time() - agent_start_time,
+                        False,
+                        "No MCP tools available",
+                    )
 
-            # 3. 创建ReAct Agent - 只传入LLM和工具
-            logger.info(
-                f"{WAIT_ICON} FundamentalAgent: Creating ReAct agent...")
-            agent = create_react_agent(llm, mcp_tools)
+                    return {
+                        "data": current_data,
+                        "messages": current_messages,
+                        "metadata": current_metadata,
+                    }
 
-            # 4. 准备输入数据，构建详细的分析请求
-            stock_code = current_data.get('stock_code', 'Unknown')
-            company_name = current_data.get('company_name', 'Unknown')
-            current_time_info = current_data.get('current_time_info', '未知时间')
-            current_date = current_data.get('current_date', '未知日期')
+                logger.info(
+                    f"{SUCCESS_ICON} "
+                    f"FundamentalAgent: Successfully loaded "
+                    f"{len(mcp_tools)} tools."
+                )
 
-            # 构建详细的基本面分析请求，包含多个分析维度
-            agent_input = f"""请分析{company_name}（股票代码：{stock_code}）的基本面情况。
+                # 打印可用工具名称，方便调试
+                tool_names = [
+                    tool.name for tool in mcp_tools
+                ]
+
+                logger.info(
+                    f"Available tools: {tool_names}"
+                )
+
+                # 3. 创建 ReAct Agent
+                logger.info(
+                    f"{WAIT_ICON} "
+                    f"FundamentalAgent: Creating ReAct agent..."
+                )
+
+                agent = create_react_agent(
+                    llm,
+                    mcp_tools,
+                )
+
+                # 4. 准备输入数据
+                stock_code = current_data.get(
+                    "stock_code",
+                    "Unknown",
+                )
+
+                company_name = current_data.get(
+                    "company_name",
+                    "Unknown",
+                )
+
+                current_time_info = current_data.get(
+                    "current_time_info",
+                    "未知时间",
+                )
+
+                current_date = current_data.get(
+                    "current_date",
+                    "未知日期",
+                )
+
+                agent_input = f"""请分析{company_name}（股票代码：{stock_code}）的基本面情况。
 
 当前时间：{current_time_info}
 当前日期：{current_date}
@@ -171,62 +222,62 @@ async def fundamental_agent(state: AgentState) -> AgentState:
 
 请使用可用的工具获取实际数据进行分析，而不是基于假设。如果某些数据无法获取，最多再调用3次工具。若某个工具没有返回有效数据，不要反复更换年份、季度或参数重试，直接说明该项数据暂缺，或者其他问题。只要已经获得公司基本信息、行业信息、盈利能力、成长能力、资产负债、现金流中的至少三类数据，就停止调用工具并输出分析。"""
 
-            logger.info(f"Agent input: {agent_input}")
+                logger.info(f"Agent input: {agent_input}")
 
-            # 5. 调用ReAct Agent - 使用正确的messages格式
-            logger.info(
-                f"{WAIT_ICON} FundamentalAgent: Calling ReAct agent...")
-            start_time = time.time()
+                # 5. 调用ReAct Agent - 使用正确的messages格式
+                logger.info(
+                    f"{WAIT_ICON} FundamentalAgent: Calling ReAct agent...")
+                start_time = time.time()
 
-            # LangGraph ReAct Agent需要messages格式的输入
-            input_data = {
-                "messages": [HumanMessage(content=agent_input)]
-            }
+                # LangGraph ReAct Agent需要messages格式的输入
+                input_data = {
+                    "messages": [HumanMessage(content=agent_input)]
+                }
 
-            # 调用 Agent执行分析
-            # response = await agent.ainvoke(input_data)
+                # 调用 Agent执行分析
+                # response = await agent.ainvoke(input_data)
 
 
-            # 调用 Agent执行分析：调试版，边执行边打印工具调用
-            response = None
-            tool_call_count = 0
-            seen_message_ids = set()
+                # 调用 Agent执行分析：调试版，边执行边打印工具调用
+                response = None
+                tool_call_count = 0
+                seen_message_ids = set()
 
-            async for chunk in agent.astream(
-                input_data,
-                config={"recursion_limit": 50},
-                stream_mode="values"
-            ):
-                response = chunk
+                async for chunk in agent.astream(
+                    input_data,
+                    config={"recursion_limit": 50},
+                    stream_mode="values"
+                ):
+                    response = chunk
 
-                messages = chunk.get("messages", [])
+                    messages = chunk.get("messages", [])
 
-                for msg in messages:
-                    msg_id = getattr(msg, "id", None) or id(msg)
-                    if msg_id in seen_message_ids:
-                        continue
-                    seen_message_ids.add(msg_id)
+                    for msg in messages:
+                        msg_id = getattr(msg, "id", None) or id(msg)
+                        if msg_id in seen_message_ids:
+                            continue
+                        seen_message_ids.add(msg_id)
 
-                    # 打印 AI 发起的工具调用
-                    if isinstance(msg, AIMessage):
-                        tool_calls = getattr(msg, "tool_calls", None)
-                        if tool_calls:
-                            for call in tool_calls:
-                                tool_call_count += 1
-                                tool_name = call.get("name", "UNKNOWN")
-                                tool_args = call.get("args", {})
+                        # 打印 AI 发起的工具调用
+                        if isinstance(msg, AIMessage):
+                            tool_calls = getattr(msg, "tool_calls", None)
+                            if tool_calls:
+                                for call in tool_calls:
+                                    tool_call_count += 1
+                                    tool_name = call.get("name", "UNKNOWN")
+                                    tool_args = call.get("args", {})
 
-                                print(f"\n[TOOL CALL #{tool_call_count}] {tool_name}")
-                                print(f"[ARGS] {tool_args}")
+                                    print(f"\n[TOOL CALL #{tool_call_count}] {tool_name}")
+                                    print(f"[ARGS] {tool_args}")
 
-                # 打印工具返回
-                    if type(msg).__name__ == "ToolMessage":
-                        tool_name = getattr(msg, "name", "UNKNOWN")
-                        content = getattr(msg, "content", "")
-                        content_text = str(content)
-                        preview = content_text[:500].replace("\n", " ")
-                        print(f"[TOOL RESULT] {tool_name}, len={len(content_text)}, preview={preview}")
-            print(f"\nTotal tool calls: {tool_call_count}")
+                    # 打印工具返回
+                        if type(msg).__name__ == "ToolMessage":
+                            tool_name = getattr(msg, "name", "UNKNOWN")
+                            content = getattr(msg, "content", "")
+                            content_text = str(content)
+                            preview = content_text[:500].replace("\n", " ")
+                            print(f"[TOOL RESULT] {tool_name}, len={len(content_text)}, preview={preview}")
+                print(f"\nTotal tool calls: {tool_call_count}")
 
 
 

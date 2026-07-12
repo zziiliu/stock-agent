@@ -1,3 +1,4 @@
+'''
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from src.utils.logging_config import setup_logger, SUCCESS_ICON, ERROR_ICON, WAIT_ICON
 from src.tools.mcp_config import SERVER_CONFIGS
@@ -139,4 +140,274 @@ if __name__ == '__main__':
         logging.basicConfig(level=logging.INFO)
         logger.info("Basic logging configured for test run.")
 
+    asyncio.run(_main_test_mcp_client())
+'''
+
+
+"""
+MCP Client 管理模块。
+
+为 LangGraph Agent 提供绑定到持久 MCP ClientSession 的工具。
+
+重要：
+    get_mcp_tools() 是异步上下文管理器，必须这样使用：
+
+        async with get_mcp_tools() as tools:
+            agent = create_react_agent(llm, tools)
+            response = await agent.ainvoke(...)
+
+    Agent 的完整执行过程必须位于 async with 内部。
+"""
+
+import asyncio
+from contextlib import asynccontextmanager
+from typing import AsyncIterator
+
+from langchain_core.tools import BaseTool
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_mcp_adapters.tools import load_mcp_tools
+
+from src.tools.mcp_config import SERVER_CONFIGS
+from src.utils.logging_config import (
+    setup_logger,
+    SUCCESS_ICON,
+    ERROR_ICON,
+    WAIT_ICON,
+)
+
+
+logger = setup_logger(__name__)
+
+
+# SERVER_CONFIGS 中对应的 MCP Server 名称
+DEFAULT_MCP_SERVER_NAME = "a_share_mcp_v2"
+
+
+# MultiServerMCPClient 本身只保存服务器配置。
+# 真正的持久连接由 client.session(...) 的上下文控制。
+_mcp_client_instance: MultiServerMCPClient | None = None
+
+
+def print_tool_details(tools: list[BaseTool]) -> None:
+    """打印 MCP 工具详细信息，用于调试。"""
+    logger.info(f"{SUCCESS_ICON} MCP 工具详细信息:")
+
+    for index, tool in enumerate(tools, start=1):
+        logger.info(f"  {index}. 工具名称: {tool.name}")
+        logger.info(f"     描述: {tool.description}")
+        logger.info(f"     工具类型: {type(tool)}")
+
+        # 不同 LangChain 版本中的 schema 属性可能略有区别
+        for attr_name in (
+            "args_schema",
+            "input_schema",
+            "parameters",
+            "schema",
+        ):
+            if not hasattr(tool, attr_name):
+                continue
+
+            try:
+                attr_value = getattr(tool, attr_name)
+            except Exception:
+                continue
+
+            if attr_value:
+                logger.info(
+                    f"     {attr_name}: {attr_value}"
+                )
+
+        logger.info("     " + "-" * 50)
+
+
+def get_mcp_client() -> MultiServerMCPClient:
+    """
+    获取全局 MultiServerMCPClient 实例。
+
+    注意：
+        缓存 MultiServerMCPClient 不等于缓存 ClientSession。
+        持久 ClientSession 由 get_mcp_tools() 上下文管理器创建。
+    """
+    global _mcp_client_instance
+
+    if _mcp_client_instance is None:
+        logger.info(
+            f"{WAIT_ICON} Initializing MultiServerMCPClient."
+        )
+
+        _mcp_client_instance = MultiServerMCPClient(
+            SERVER_CONFIGS
+        )
+
+        logger.info(
+            f"{SUCCESS_ICON} MultiServerMCPClient initialized."
+        )
+
+    return _mcp_client_instance
+
+
+@asynccontextmanager
+async def get_mcp_tools(
+    server_name: str = DEFAULT_MCP_SERVER_NAME,
+) -> AsyncIterator[list[BaseTool]]:
+    """
+    打开一个持久 MCP ClientSession，并加载绑定到该会话的工具。
+
+    在 async with 生命周期内：
+
+        1. stdio MCP Server 子进程保持运行；
+        2. 所有 MCP tool 复用同一个 ClientSession；
+        3. tool 调用不会每次重新启动 MCP Server；
+        4. 退出上下文后，session 和子进程会自动关闭。
+
+    Args:
+        server_name:
+            SERVER_CONFIGS 中的 MCP Server 名称。
+
+    Yields:
+        绑定到当前持久 ClientSession 的 LangChain 工具列表。
+
+    Raises:
+        KeyError:
+            server_name 不存在于 SERVER_CONFIGS。
+
+        RuntimeError:
+            MCP Server 没有返回任何工具。
+
+        Exception:
+            MCP 连接、工具加载或 session 执行期间发生异常。
+    """
+    if server_name not in SERVER_CONFIGS:
+        available_servers = list(SERVER_CONFIGS.keys())
+
+        raise KeyError(
+            f"MCP server '{server_name}' does not exist. "
+            f"Available servers: {available_servers}"
+        )
+
+    client = get_mcp_client()
+
+    logger.info(
+        f"{WAIT_ICON} Opening persistent MCP session "
+        f"for server '{server_name}'..."
+    )
+
+    try:
+        # 对于 stdio transport：
+        # 进入这里时启动 MCP Server 子进程；
+        # 退出这里时关闭 ClientSession 和子进程。
+        async with client.session(server_name) as session:
+            logger.info(
+                f"{SUCCESS_ICON} Persistent MCP session opened "
+                f"for '{server_name}'."
+            )
+
+            tools = await load_mcp_tools(session)
+
+            if not tools:
+                raise RuntimeError(
+                    f"No tools were loaded from MCP server "
+                    f"'{server_name}'."
+                )
+
+            logger.info(
+                f"{SUCCESS_ICON} Successfully loaded "
+                f"{len(tools)} tools from '{server_name}'."
+            )
+
+            tool_names = [tool.name for tool in tools]
+            logger.info(
+                f"MCP tools from '{server_name}': {tool_names}"
+            )
+
+            # 需要时再打开，避免日志太长
+            # print_tool_details(tools)
+
+            # Agent 的 ainvoke/astream 必须发生在 yield 尚未结束时
+            yield tools
+
+    except asyncio.CancelledError:
+        logger.warning(
+            f"MCP session for '{server_name}' was cancelled."
+        )
+        raise
+
+    except Exception as exc:
+        logger.error(
+            f"{ERROR_ICON} MCP session or tool loading failed "
+            f"for '{server_name}': {exc}",
+            exc_info=True,
+        )
+        raise
+
+    finally:
+        logger.info(
+            f"{WAIT_ICON} MCP session context finished "
+            f"for '{server_name}'."
+        )
+
+
+async def close_mcp_client_sessions() -> None:
+    """
+    兼容旧代码的清理函数。
+
+    持久 ClientSession 已经由 get_mcp_tools() 的 async with
+    自动关闭。这里主要清除缓存的 MultiServerMCPClient 配置实例，
+    方便测试或后续重新初始化。
+    """
+    global _mcp_client_instance
+
+    if _mcp_client_instance is None:
+        logger.info(
+            "MCP client was not initialized; nothing to reset."
+        )
+        return
+
+    logger.info(
+        f"{WAIT_ICON} Resetting MultiServerMCPClient instance..."
+    )
+
+    _mcp_client_instance = None
+
+    logger.info(
+        f"{SUCCESS_ICON} MultiServerMCPClient instance reset."
+    )
+
+
+async def _main_test_mcp_client() -> None:
+    """
+    直接运行本文件时的测试入口。
+
+    运行方式：
+        python -m src.tools.mcp_client
+    """
+    logger.info("--- Testing persistent MCP session ---")
+
+    try:
+        async with get_mcp_tools() as tools:
+            print(
+                f"Successfully loaded {len(tools)} tools:"
+            )
+
+            for tool in tools:
+                print(f"- {tool.name}")
+
+            logger.info(
+                "Persistent session is active. "
+                "Tool invocation test is skipped because "
+                "each tool requires different arguments."
+            )
+
+    except Exception as exc:
+        logger.error(
+            f"{ERROR_ICON} MCP client test failed: {exc}",
+            exc_info=True,
+        )
+
+    finally:
+        await close_mcp_client_sessions()
+        logger.info("--- MCP Client test complete ---")
+
+
+if __name__ == "__main__":
     asyncio.run(_main_test_mcp_client())

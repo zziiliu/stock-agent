@@ -19,6 +19,22 @@ from src.tools.date_utils import register_date_utils_tools
 from src.tools.analysis import register_analysis_tools
 from src.tools.news_crawler import register_news_crawler_tools
 
+# ###############################################
+# 查看进行tool调用时，实际启动了多少个mcp_server进程
+import os
+import sys
+
+print(
+    f"[MCP SERVER START] "
+    f"pid={os.getpid()} "
+    f"ppid={os.getppid()} "
+    f"file={__file__}",
+    file=sys.stderr,
+    flush=True,
+)
+# ###############################################
+
+
 # --- Logging Setup ---
 # Call the setup function from utils
 # You can control the default level here (e.g., logging.DEBUG for more verbose logs)
