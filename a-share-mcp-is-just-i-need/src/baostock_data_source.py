@@ -500,8 +500,10 @@ class BaostockDataSource(FinancialDataSource):
                         full_content = abstract
                     
                     # 使用模型分析内容
-                    risk_analysis = self._analyze_risk(full_content, risk_model, risk_tokenizer) if risk_model else "未分析"
-                    sentiment_analysis = self._analyze_sentiment(full_content, sentiment_model, sentiment_tokenizer) if sentiment_model else "未分析"
+                    # risk_analysis = self._analyze_risk(full_content, risk_model, risk_tokenizer) if risk_model else "未分析"
+                    # sentiment_analysis = self._analyze_sentiment(full_content, sentiment_model, sentiment_tokenizer) if sentiment_model else "未分析"
+                    risk_analysis = "交由 NewsAgent 分析"
+                    sentiment_analysis = "交由 NewsAgent 分析"
                     
                     results.append({
                         'title': title,

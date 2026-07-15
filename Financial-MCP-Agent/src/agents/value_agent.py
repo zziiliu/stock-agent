@@ -23,7 +23,15 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 logger = setup_logger(__name__)
-
+VALUE_TOOL_NAMES = frozenset({
+    "get_stock_basic_info",
+    "get_stock_industry",
+    "get_historical_k_data",
+    "get_profit_data",
+    "get_growth_data",
+    "get_balance_data",
+    "get_dividend_data",
+})
 
 async def value_agent(state: AgentState) -> AgentState:
     """
@@ -102,7 +110,20 @@ async def value_agent(state: AgentState) -> AgentState:
         try:
             # get_mcp_tools() 已经是异步上下文管理器，
             # 不能再使用 await get_mcp_tools()
-            async with get_mcp_tools() as mcp_tools:
+            async with get_mcp_tools() as all_mcp_tools:
+                mcp_tools = [
+                    tool
+                    for tool in all_mcp_tools
+                    if tool.name in VALUE_TOOL_NAMES
+                ]
+
+                loaded_names = {tool.name for tool in mcp_tools}
+                missing_names = VALUE_TOOL_NAMES - loaded_names
+
+                if missing_names:
+                    raise RuntimeError(
+                        f"ValueAgent 缺少 MCP 工具: {sorted(missing_names)}"
+                    )
                 if not mcp_tools:
                     logger.error(
                         f"{ERROR_ICON} ValueAgent: No MCP tools available."
@@ -173,17 +194,16 @@ async def value_agent(state: AgentState) -> AgentState:
 当前日期：{current_date}
 
 请进行以下估值分析：
-1. 获取公司基本信息（市值、股价等）
-2. 获取并分析主要估值指标（市盈率、市净率、市销率等）
-3. 将估值指标与行业平均水平进行对比分析
-4. 分析历史估值水平变化趋势
-5. 获取并分析股息数据和股息收益率
-6. 计算和分析内在价值
-7. 提供估值总结和投资建议
+1. 获取公司基础信息和所属行业
+2. 获取近期股价及历史 PE、PB、PS、PCF 等估值指标
+3. 分析当前估值相对于自身历史水平的位置
+4. 结合盈利能力、成长能力和资产负债情况，判断估值是否有基本面支撑
+5. 分析历史分红情况
+6. 给出偏高、合理或偏低的估值判断
 
-重要限制：请专注于估值指标和财务数据分析，不要使用crawl_news工具获取新闻信息。估值分析应该基于财务指标、估值比率和历史数据，而不是新闻事件。
-
-请使用可用的工具获取实际数据进行分析，而不是基于假设。如果某些数据无法获取，请尝试使用不同的工具或参数组合，基于可用信息提供尽可能全面的分析。请保持回答简洁，避免冗长的描述性文字"""
+如果工具没有返回行业平均估值、同行估值、市值或现金流预测数据，
+不要自行假设，也不要计算 DCF 内在价值，应明确说明数据不足。
+"""
 
                 logger.info(
                     f"Agent input: {agent_input}"

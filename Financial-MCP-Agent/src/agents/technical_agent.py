@@ -24,7 +24,10 @@ load_dotenv(override=True)
 
 logger = setup_logger(__name__)
 
-
+TECHNICAL_TOOL_NAMES = frozenset({
+    "get_stock_basic_info",
+    "get_historical_k_data",
+})
 async def technical_agent(state: AgentState) -> AgentState:
     """
     使用ReAct框架进行技术分析，直接集成MCP工具
@@ -96,7 +99,25 @@ async def technical_agent(state: AgentState) -> AgentState:
         try:
             # get_mcp_tools() 现在是异步上下文管理器，
             # 不能再使用 await get_mcp_tools()
-            async with get_mcp_tools() as mcp_tools:
+            async with get_mcp_tools() as all_mcp_tools:
+                mcp_tools = [
+                    tool
+                    for tool in all_mcp_tools
+                    if tool.name in TECHNICAL_TOOL_NAMES
+                ]
+
+                loaded_names = {tool.name for tool in mcp_tools}
+                missing_names = TECHNICAL_TOOL_NAMES - loaded_names
+
+                if missing_names:
+                    raise RuntimeError(
+                        f"TechnicalAgent 缺少 MCP 工具: {sorted(missing_names)}"
+                    )
+
+                logger.info(
+                    "TechnicalAgent loaded tools: %s",
+                    sorted(loaded_names),
+                )
                 if not mcp_tools:
                     logger.error(
                         f"{ERROR_ICON} "

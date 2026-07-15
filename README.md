@@ -70,5 +70,5 @@ python -m src.agents.fundamental_agent
 windows下运行所有agent测试:
 ```bash
 cd Financial-MCP-Agent
-python src/main.py --command "帮我看看茅台(600519)这只股票值得投资吗"
+python -m src.main --command "帮我看看茅台(600519)这只股票值得投资吗"
 ```

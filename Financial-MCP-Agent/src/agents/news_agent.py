@@ -24,7 +24,9 @@ load_dotenv(override=True)
 
 logger = setup_logger(__name__)
 
-
+NEWS_TOOL_NAMES = frozenset({
+    "crawl_news",
+})
 async def news_agent(state: AgentState) -> AgentState:
     """
     使用ReAct框架进行新闻分析，包含情感分析和风险评估，直接集成MCP工具
@@ -100,7 +102,24 @@ async def news_agent(state: AgentState) -> AgentState:
         try:
             # get_mcp_tools() 现在是异步上下文管理器，
             # 不能再写成 await get_mcp_tools()
-            async with get_mcp_tools() as mcp_tools:
+            async with get_mcp_tools() as all_mcp_tools:
+                mcp_tools = [
+                    tool
+                    for tool in all_mcp_tools
+                    if tool.name in NEWS_TOOL_NAMES
+                ]
+
+                loaded_names = {tool.name for tool in mcp_tools}
+                missing_names = NEWS_TOOL_NAMES - loaded_names
+                if missing_names:
+                    raise RuntimeError(
+                        f"NewsAgent 缺少 MCP 工具: {sorted(missing_names)}"
+                    )
+
+                logger.info(
+                    "NewsAgent loaded tools: %s",
+                    sorted(loaded_names),
+                )
                 if not mcp_tools:
                     logger.error(
                         f"{ERROR_ICON} NewsAgent: No MCP tools available."
@@ -170,6 +189,13 @@ async def news_agent(state: AgentState) -> AgentState:
 4. 分析新闻对股价的潜在影响
 5. 识别关键新闻事件和趋势
 6. 提供基于新闻的综合投资建议
+严格要求：
+1. 只能使用 crawl_news 工具实际返回的内容，禁止使用模型记忆补充数据。
+2. 每条新闻必须附带工具返回的原始链接。
+3. 工具未返回的数据必须明确写“暂无可靠数据”，禁止猜测。
+4. 回购价格上限不是目标价，不得据此计算上涨空间。
+5. 不得把资讯列表页、行情页、公司主页当作独立新闻。
+6. 若有效新闻不足5条，应如实说明，不得虚构补足。
 
 请使用可用的工具获取实际新闻数据进行分析，确保情感分析和风险评估的准确性。如果某些新闻无法获取，请基于可用信息提供尽可能全面的分析。"""
 
@@ -192,7 +218,23 @@ async def news_agent(state: AgentState) -> AgentState:
                 # Agent 的完整执行必须放在 async with 内，
                 # 否则 MCP session 会提前关闭。
                 response = await agent.ainvoke(input_data)
+                print("\n" + "=" * 80)
+                print("ReAct 完整消息轨迹")
+                print("=" * 80)
 
+                for index, message in enumerate(response.get("messages", []), start=1):
+                    print(f"\n[{index}] 类型: {type(message).__name__}")
+                    print(f"内容: {getattr(message, 'content', '')}")
+
+                    tool_calls = getattr(message, "tool_calls", None)
+                    if tool_calls:
+                        print("工具调用:")
+                        print(json.dumps(
+                            tool_calls,
+                            ensure_ascii=False,
+                            indent=2,
+                            default=str,
+                        ))
             # 退出 async with 后 MCP session 才关闭。
             # 此时 Agent 的全部工具调用已经执行完毕。
             end_time = time.time()
@@ -395,45 +437,185 @@ async def news_agent(state: AgentState) -> AgentState:
         }
 
 
-# 本地测试函数
 async def test_news_agent():
-    """新闻分析 Agent的测试函数"""
-    from src.utils.state_definition import AgentState
+    """
+    分两阶段测试 NewsAgent：
+
+    1. 直接调用 crawl_news，查看 MCP Tool 的原始返回；
+    2. 可选地运行完整 NewsAgent，确认是否发生 ReAct 循环。
+    """
+    import asyncio
+    import json
     from datetime import datetime
 
-    # 准备测试数据，包含当前时间信息
-    current_datetime = datetime.now()
-    current_date_cn = current_datetime.strftime("%Y年%m月%d日")
-    current_date_en = current_datetime.strftime("%Y-%m-%d")
-    current_weekday_cn = ["星期一", "星期二", "星期三", "星期四",
-                          "星期五", "星期六", "星期日"][current_datetime.weekday()]
-    current_time = current_datetime.strftime("%H:%M:%S")
-    current_time_info = f"{current_date_cn} ({current_date_en}) {current_weekday_cn} {current_time}"
+    from src.utils.state_definition import AgentState
+    from src.tools.mcp_client import get_mcp_tools
 
-    # 创建测试状态，模拟真实的用户查询
+    company_name = "嘉友国际"
+    stock_code = "sh.603871"
+
+    # 是否继续运行完整 NewsAgent。
+    # 先保持 False，只检查 crawl_news 原始结果。
+    run_full_agent = True
+
+    print("\n" + "=" * 80)
+    print("第一阶段：直接测试 crawl_news MCP Tool")
+    print("=" * 80)
+
+    try:
+        async with get_mcp_tools() as all_mcp_tools:
+            tool_names = [tool.name for tool in all_mcp_tools]
+
+            print(f"\nMCP Server 共加载 {len(all_mcp_tools)} 个工具：")
+            print(tool_names)
+
+            news_tool = next(
+                (
+                    tool
+                    for tool in all_mcp_tools
+                    if tool.name == "crawl_news"
+                ),
+                None,
+            )
+
+            if news_tool is None:
+                raise RuntimeError(
+                    "MCP Server 中没有找到 crawl_news 工具"
+                )
+
+            print("\n找到工具：crawl_news")
+            print(f"工具类型：{type(news_tool)}")
+            print(
+                "参数 Schema：",
+                getattr(news_tool, "args_schema", None),
+            )
+
+            tool_args = {
+                "query": f"{company_name} 最新新闻",
+                "top_k": 10,
+            }
+
+            print("\n即将调用 crawl_news：")
+            print(json.dumps(
+                tool_args,
+                ensure_ascii=False,
+                indent=2,
+            ))
+
+            # 防止爬虫一直卡住
+            raw_result = await asyncio.wait_for(
+                news_tool.ainvoke(tool_args),
+                timeout=60,
+            )
+
+            print("\n" + "-" * 80)
+            print("crawl_news 原始返回")
+            print("-" * 80)
+
+            print(f"返回类型：{type(raw_result)}")
+            print(f"repr：{repr(raw_result)}")
+
+            if isinstance(raw_result, (dict, list)):
+                print("\nJSON 格式化结果：")
+                print(json.dumps(
+                    raw_result,
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                ))
+            else:
+                result_text = str(raw_result)
+
+                print(f"\n字符串长度：{len(result_text)}")
+                print("\n完整内容：")
+                print(result_text)
+
+            print("-" * 80)
+
+    except asyncio.TimeoutError:
+        print(
+            "\n[测试失败] crawl_news 调用超过 60 秒，"
+            "可能是爬虫请求阻塞、网站响应过慢或被反爬。"
+        )
+        return None
+
+    except Exception as exc:
+        print("\n[测试失败] crawl_news 直接调用出现异常：")
+        print(f"异常类型：{type(exc).__name__}")
+        print(f"异常内容：{exc}")
+        raise
+
+    # 先只测工具，避免再次进入 ReAct 死循环
+    if not run_full_agent:
+        print(
+            "\n已跳过完整 NewsAgent 测试。"
+            "\n请先检查上面的 crawl_news 原始返回结果。"
+        )
+        return raw_result
+
+    print("\n" + "=" * 80)
+    print("第二阶段：运行完整 NewsAgent")
+    print("=" * 80)
+
+    current_datetime = datetime.now()
+    current_date_cn = current_datetime.strftime(
+        "%Y年%m月%d日"
+    )
+    current_date_en = current_datetime.strftime(
+        "%Y-%m-%d"
+    )
+
+    current_weekday_cn = [
+        "星期一",
+        "星期二",
+        "星期三",
+        "星期四",
+        "星期五",
+        "星期六",
+        "星期日",
+    ][current_datetime.weekday()]
+
+    current_time = current_datetime.strftime("%H:%M:%S")
+
+    current_time_info = (
+        f"{current_date_cn} "
+        f"({current_date_en}) "
+        f"{current_weekday_cn} "
+        f"{current_time}"
+    )
+
     test_state = AgentState(
         messages=[],
         data={
             "query": "分析嘉友国际的新闻情况",
-            "stock_code": "sh.603871",
-            "company_name": "嘉友国际",
+            "stock_code": stock_code,
+            "company_name": company_name,
             "current_date": current_date_en,
             "current_date_cn": current_date_cn,
             "current_time": current_time,
             "current_weekday_cn": current_weekday_cn,
             "current_time_info": current_time_info,
-            "analysis_timestamp": current_datetime.isoformat()
+            "analysis_timestamp": (
+                current_datetime.isoformat()
+            ),
         },
-        metadata={}
+        metadata={},
     )
 
-    # 运行 Agent并输出结果
     result = await news_agent(test_state)
-    print("News Analysis Result:")
-    print(result.get("data", {}).get("news_analysis", "No analysis found"))
+
+    print("\nNews Analysis Result:")
+    print(
+        result.get("data", {}).get(
+            "news_analysis",
+            "No analysis found",
+        )
+    )
 
     return result
 
+
 if __name__ == "__main__":
     import asyncio
+
     asyncio.run(test_news_agent())
