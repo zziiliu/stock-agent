@@ -21,6 +21,162 @@ start_node → [fundamental_analyst, technical_analyst, value_analyst] → summa
 import os
 import sys
 
+from pathlib import Path
+import atexit
+import threading
+from datetime import datetime as _bootstrap_datetime
+
+
+class TeeStream:
+    """把输出同时写到终端和日志文件。"""
+
+    def __init__(self, *streams):
+        self.streams = streams
+        self._lock = threading.Lock()
+
+    @property
+    def encoding(self):
+        for stream in self.streams:
+            encoding = getattr(stream, "encoding", None)
+            if encoding:
+                return encoding
+        return "utf-8"
+
+    def write(self, data):
+        if not data:
+            return 0
+
+        with self._lock:
+            for stream in self.streams:
+                try:
+                    stream.write(data)
+                    stream.flush()
+                except (OSError, ValueError):
+                    # 某个流已经关闭时，不影响其他流继续写入。
+                    continue
+
+        return len(data)
+
+    def flush(self):
+        with self._lock:
+            for stream in self.streams:
+                try:
+                    stream.flush()
+                except (OSError, ValueError):
+                    continue
+
+    def isatty(self):
+        return any(
+            bool(getattr(stream, "isatty", lambda: False)())
+            for stream in self.streams
+        )
+
+    def fileno(self):
+        # 某些第三方库会调用 fileno()。
+        for stream in self.streams:
+            try:
+                return stream.fileno()
+            except (AttributeError, OSError):
+                continue
+        raise OSError("TeeStream has no file descriptor")
+
+
+_ORIGINAL_STDOUT = sys.stdout
+_ORIGINAL_STDERR = sys.stderr
+_TERMINAL_LOG_FILE = None
+TERMINAL_LOG_PATH = None
+
+
+def _get_output_file_from_argv():
+    """
+    在 argparse 初始化前读取 --output-file。
+
+    支持：
+        --output-file path/to/file.log
+        --output-file=path/to/file.log
+    """
+    for index, arg in enumerate(sys.argv[1:], start=1):
+        if arg.startswith("--output-file="):
+            return arg.split("=", 1)[1]
+
+        if arg == "--output-file" and index + 1 < len(sys.argv):
+            return sys.argv[index + 1]
+
+    return None
+
+
+def _restore_terminal_streams():
+    """程序退出时恢复标准输出并关闭日志文件。"""
+    global _TERMINAL_LOG_FILE
+
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+    sys.stdout = _ORIGINAL_STDOUT
+    sys.stderr = _ORIGINAL_STDERR
+
+    if _TERMINAL_LOG_FILE is not None:
+        try:
+            _TERMINAL_LOG_FILE.flush()
+            _TERMINAL_LOG_FILE.close()
+        except OSError:
+            pass
+        _TERMINAL_LOG_FILE = None
+
+
+def _start_terminal_capture():
+    """
+    启动终端输出捕获。
+
+    默认日志位置：
+        项目根目录/logs/terminal/financial_agent_时间戳.log
+    """
+    global _TERMINAL_LOG_FILE, TERMINAL_LOG_PATH
+
+    custom_path = _get_output_file_from_argv()
+
+    if custom_path:
+        log_path = Path(custom_path).expanduser()
+        if not log_path.is_absolute():
+            log_path = Path.cwd() / log_path
+    else:
+        project_root = Path(__file__).resolve().parents[1]
+        timestamp = _bootstrap_datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = (
+            project_root
+            / "logs"
+            / "terminal"
+            / f"financial_agent_{timestamp}.log"
+        )
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    _TERMINAL_LOG_FILE = log_path.open(
+        mode="a",
+        encoding="utf-8",
+        buffering=1,
+    )
+    TERMINAL_LOG_PATH = str(log_path.resolve())
+
+    # stdout 和 stderr 都同时写入终端与同一个日志文件。
+    sys.stdout = TeeStream(_ORIGINAL_STDOUT, _TERMINAL_LOG_FILE)
+    sys.stderr = TeeStream(_ORIGINAL_STDERR, _TERMINAL_LOG_FILE)
+
+    atexit.register(_restore_terminal_streams)
+
+    print("=" * 80)
+    print(f"完整终端输出将保存到: {TERMINAL_LOG_PATH}")
+    print("=" * 80)
+
+
+# 必须在导入项目模块和第三方模块前启动，
+# 这样 import 阶段的 warning、logging、traceback 也能被记录。
+_start_terminal_capture()
+
+
 # 设置环境变量来抑制transformers和其他库的冗余输出
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"  # 只显示错误信息
 os.environ["TOKENIZERS_PARALLELISM"] = "false"  # 禁用tokenizer并行化警告
@@ -154,6 +310,15 @@ async def main():
             type=str,
             required=False,  # 改为非必需，支持交互式输入
             help="The user query for financial analysis (e.g., '分析嘉友国际')"
+        )
+        parser.add_argument(
+            "--output-file",
+            type=str,
+            required=False,
+            help=(
+                "完整终端输出日志路径。未指定时自动保存到 "
+                "logs/terminal/financial_agent_时间戳.log"
+            ),
         )
         args = parser.parse_args()
 
@@ -514,6 +679,7 @@ async def main():
         # 完成执行日志记录
         finalize_execution_logger(success=True)
         print(f"{SUCCESS_ICON} 执行日志已保存到: {execution_logger.execution_dir}")
+        print(f"{SUCCESS_ICON} 完整终端输出已保存到: {TERMINAL_LOG_PATH}")
 
     except Exception as e:
         # ============================================================================
@@ -526,6 +692,7 @@ async def main():
         # 记录错误并完成执行日志
         finalize_execution_logger(success=False, error=str(e))
         print(f"{ERROR_ICON} 错误日志已保存到: {get_execution_logger().execution_dir}")
+        print(f"{ERROR_ICON} 完整终端输出已保存到: {TERMINAL_LOG_PATH}")
 
 
 # ============================================================================

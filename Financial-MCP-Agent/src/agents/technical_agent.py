@@ -5,6 +5,7 @@ TechnicalAnalysis Agent: Performs technical analysis of a stock using ReAct Agen
 import os
 import json
 from typing import Dict, Any, List, Optional
+from datetime import datetime, timedelta
 from langchain_core.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, BaseMessage
@@ -28,6 +29,38 @@ TECHNICAL_TOOL_NAMES = frozenset({
     "get_stock_basic_info",
     "get_historical_k_data",
 })
+
+
+def _safe_kline_date(value: str) -> str:
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+        return value
+    except Exception:
+        return datetime.now().strftime("%Y-%m-%d")
+
+
+def _compact_tool_result(value: Any, limit: int = 5000) -> str:
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}\n...[truncated {len(text) - limit} chars]"
+
+
+def _normalize_kline_tool_code(stock_code: str) -> str:
+    cleaned = str(stock_code or "").strip().lower()
+    if cleaned.startswith(("sh.", "sz.")):
+        return cleaned
+
+    digits = "".join(char for char in cleaned if char.isdigit())
+    if len(digits) != 6:
+        return cleaned
+    if digits.startswith("6"):
+        return f"sh.{digits}"
+    if digits.startswith(("0", "3")):
+        return f"sz.{digits}"
+    return digits
+
+
 async def technical_agent(state: AgentState) -> AgentState:
     """
     使用ReAct框架进行技术分析，直接集成MCP工具
@@ -184,11 +217,72 @@ async def technical_agent(state: AgentState) -> AgentState:
                     "未知日期",
                 )
 
+                kline_tool = next(
+                    tool for tool in mcp_tools if tool.name == "get_historical_k_data"
+                )
+                kline_end_date = _safe_kline_date(current_date)
+                kline_start_date = (
+                    datetime.strptime(kline_end_date, "%Y-%m-%d") - timedelta(days=240)
+                ).strftime("%Y-%m-%d")
+                mandatory_kline_args = {
+                    "code": _normalize_kline_tool_code(stock_code),
+                    "start_date": kline_start_date,
+                    "end_date": kline_end_date,
+                    "frequency": "d",
+                    "adjust_flag": "3",
+                    "fields": [
+                        "date",
+                        "code",
+                        "open",
+                        "high",
+                        "low",
+                        "close",
+                        "volume",
+                        "amount",
+                        "pctChg",
+                    ],
+                }
+                mandatory_kline_result = ""
+
+                try:
+                    mandatory_kline_result = await kline_tool.ainvoke(
+                        mandatory_kline_args
+                    )
+                    current_data["mandatory_kline_tool_used"] = True
+                    current_data["mandatory_kline_tool_args"] = mandatory_kline_args
+                    current_data["mandatory_kline_tool_preview"] = _compact_tool_result(
+                        mandatory_kline_result,
+                        2000,
+                    )
+                    logger.info(
+                        "TechnicalAgent mandatory get_historical_k_data call completed."
+                    )
+                except Exception as exc:
+                    current_data["mandatory_kline_tool_used"] = False
+                    current_data["mandatory_kline_tool_error"] = str(exc)
+                    mandatory_kline_result = f"Error calling get_historical_k_data: {exc}"
+                    logger.error(
+                        "TechnicalAgent mandatory get_historical_k_data call failed: %s",
+                        exc,
+                        exc_info=True,
+                    )
+
                 # 构建详细的技术分析请求
                 agent_input = f"""请分析{company_name}（股票代码：{stock_code}）的技术指标。
 
 当前时间：{current_time_info}
 当前日期：{current_date}
+
+MANDATORY K-LINE TOOL CALL:
+- The technical agent MUST use get_historical_k_data for this stock.
+- A mandatory get_historical_k_data call has already been executed with:
+  {json.dumps(mandatory_kline_args, ensure_ascii=False)}
+- You must base the K-line and price-volume part of the analysis on this actual tool result.
+- If the tool result contains an error, clearly state that K-line data could not be retrieved and do not fabricate prices.
+- Include a short line in your final answer: KLINE_TOOL_USED: {"yes" if current_data.get("mandatory_kline_tool_used") else "no"}
+
+MANDATORY K-LINE TOOL RESULT:
+{_compact_tool_result(mandatory_kline_result)}
 
 请进行以下技术分析：
 1. 获取股票基本信息和最新价格
@@ -296,9 +390,9 @@ async def technical_agent(state: AgentState) -> AgentState:
                 f"{len(final_output)} characters"
             )
 
-            print(
-                f"TECHNICALAGENT: {final_output}"
-            )
+            print("::agent-output-start technical", flush=True)
+            print(final_output, flush=True)
+            print("::agent-output-end technical", flush=True)
 
             # 7. 记录LLM交互
             model_config = {

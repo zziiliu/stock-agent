@@ -1,4 +1,4 @@
-"""
+﻿"""
 财务报表相关工具，用于MCP服务器
 """
 import logging
@@ -6,7 +6,7 @@ from typing import List, Optional
 
 from mcp.server.fastmcp import FastMCP
 from src.data_source_interface import FinancialDataSource
-from src.tools.base import call_financial_data_tool
+from src.tools.base import call_financial_data_tool, call_with_baostock_auth_retry
 
 logger = logging.getLogger(__name__)
 
@@ -40,9 +40,9 @@ def safe_financial_report_fetch(
     try:
         # 根据参数类型调用不同的数据源函数
         if year and quarter:
-            df = data_source_func(code=code, year=year, quarter=quarter)
+            df = call_with_baostock_auth_retry(func_name, lambda: data_source_func(code=code, year=year, quarter=quarter))
         elif start_date and end_date:
-            df = data_source_func(code=code, start_date=start_date, end_date=end_date)
+            df = call_with_baostock_auth_retry(func_name, lambda: data_source_func(code=code, start_date=start_date, end_date=end_date))
         else:
             raise ValueError("Invalid parameters provided")
         
@@ -229,4 +229,5 @@ def register_financial_report_tools(app: FastMCP, active_data_source: FinancialD
             start_date=start_date,
             end_date=end_date
         )
+
 

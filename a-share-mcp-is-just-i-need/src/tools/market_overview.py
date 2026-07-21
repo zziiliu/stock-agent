@@ -1,4 +1,4 @@
-"""
+﻿"""
 市场概览工具，用于MCP服务器
 包含获取交易日和所有股票数据的工具
 """
@@ -8,6 +8,7 @@ from typing import Optional
 from mcp.server.fastmcp import FastMCP
 from src.data_source_interface import FinancialDataSource, NoDataFoundError, LoginError, DataSourceError
 from src.formatting.markdown_formatter import format_df_to_markdown
+from src.tools.base import call_with_baostock_auth_retry
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +33,7 @@ def safe_market_data_fetch(
     """
     try:
         # 调用数据源函数
-        df = data_source_func(**kwargs)
+        df = call_with_baostock_auth_retry(func_name, lambda: data_source_func(**kwargs))
         logger.info(f"Successfully retrieved {data_type} data.")
         return format_df_to_markdown(df)
         
@@ -105,4 +106,5 @@ def register_market_overview_tools(app: FastMCP, active_data_source: FinancialDa
             "所有股票",
             date=date
         )
+
 

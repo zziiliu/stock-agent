@@ -301,7 +301,9 @@ async def value_agent(state: AgentState) -> AgentState:
                 f"Final extracted analysis length: "
                 f"{len(final_output)} characters"
             )
-            print(f"VALUEAGENT: {final_output}")
+            print("::agent-output-start value", flush=True)
+            print(final_output, flush=True)
+            print("::agent-output-end value", flush=True)
 
             # 7. 记录LLM交互
             model_config = {

@@ -1,8 +1,11 @@
-"""
+﻿"""
 MCP工具的基础工具模块
 包含用于调用数据源的共享辅助函数
 """
 import logging
+import os
+import random
+import time
 from typing import Callable, Optional
 import pandas as pd
 
@@ -10,6 +13,54 @@ from src.formatting.markdown_formatter import format_df_to_markdown
 from src.data_source_interface import NoDataFoundError, LoginError, DataSourceError
 
 logger = logging.getLogger(__name__)
+
+
+def _is_baostock_auth_error(error: Exception) -> bool:
+    """Return True for transient baostock login/session errors worth retrying."""
+    if isinstance(error, LoginError):
+        return True
+    text = str(error)
+    lowered = text.lower()
+    return (
+        "10001001" in text
+        or "未登录" in text
+        or "not logged" in lowered
+        or "not login" in lowered
+    )
+
+
+def call_with_baostock_auth_retry(tool_name: str, operation: Callable):
+    """Retry a data-source call only when baostock reports a transient auth state."""
+    attempts_text = os.getenv("BAOSTOCK_AUTH_RETRY_ATTEMPTS", "3")
+    try:
+        max_attempts = max(1, int(attempts_text))
+    except ValueError:
+        max_attempts = 3
+
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return operation()
+        except (LoginError, DataSourceError) as error:
+            last_error = error
+            if attempt >= max_attempts or not _is_baostock_auth_error(error):
+                raise
+
+            delay = 0.35 * attempt + random.uniform(0.0, 0.25)
+            logger.warning(
+                "Retrying %s after baostock auth/session error (%s/%s): %s; sleeping %.2fs",
+                tool_name,
+                attempt,
+                max_attempts,
+                error,
+                delay,
+            )
+            time.sleep(delay)
+
+    if last_error is not None:
+        raise last_error
+    return operation()
+
 
 def safe_data_source_call(
     tool_name: str,
@@ -31,7 +82,7 @@ def safe_data_source_call(
     """
     try:
         # 调用数据源方法
-        df = data_source_method(**kwargs)
+        df = call_with_baostock_auth_retry(tool_name, lambda: data_source_method(**kwargs))
         logger.info(f"Successfully retrieved {data_type_name} data.")
         return format_df_to_markdown(df)
         
@@ -86,7 +137,7 @@ def call_financial_data_tool(
             return f"Error: Invalid quarter '{quarter}'. Must be between 1 and 4."
 
         # 调用已实例化的active_data_source上的相应方法
-        df = data_source_method(code=code, year=year, quarter=quarter)
+        df = call_with_baostock_auth_retry(tool_name, lambda: data_source_method(code=code, year=year, quarter=quarter))
         logger.info(
             f"Successfully retrieved {data_type_name} data for {code}, {year}Q{quarter}.")
         # 对财务表格使用较小的限制？
@@ -173,3 +224,4 @@ def call_index_constituent_tool(
         index_name,
         date=date
     )
+

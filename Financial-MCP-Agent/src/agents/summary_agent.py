@@ -4,6 +4,7 @@ Summary Agent: Consolidates analyses from other agents into a final report.
 """
 import os
 import time
+import json
 from typing import Dict, Any
 from langchain_openai import ChatOpenAI  # 恢复OpenAI导入
 import torch
@@ -19,6 +20,55 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 logger = setup_logger(__name__)
+
+
+def normalize_kline_embed_code(stock_code: str) -> str:
+    cleaned = str(stock_code or "").strip().lower()
+    if cleaned.startswith(("sh.", "sz.")):
+        return cleaned
+
+    digits = "".join(char for char in cleaned if char.isdigit())
+    if len(digits) != 6:
+        return cleaned
+    if digits.startswith("6"):
+        return f"sh.{digits}"
+    if digits.startswith(("0", "3")):
+        return f"sz.{digits}"
+    return digits
+
+
+def build_kline_embed_block(stock_code: str, heading_level: int = 3) -> str:
+    code = normalize_kline_embed_code(stock_code)
+    if not code or code.lower().startswith("unknown"):
+        return ""
+
+    config = {
+        "code": code,
+        "days": 240,
+        "frequency": "d",
+        "adjust_flag": "3",
+    }
+    payload = json.dumps(config, ensure_ascii=False)
+    heading = "#" * heading_level
+    return f"\n\n{heading} K线图\n\n<!-- finance-kline {payload} -->\n"
+
+
+def insert_kline_embed_block(report_content: str, stock_code: str) -> str:
+    if "finance-kline" in report_content:
+        return report_content
+
+    technical_heading = re.compile(
+        r"(^##\s*(?:技术分析|Technical Analysis|技术面分析).*$\n?)",
+        re.MULTILINE | re.IGNORECASE,
+    )
+    block = build_kline_embed_block(stock_code, heading_level=3)
+    if not block:
+        return report_content
+
+    if technical_heading.search(report_content):
+        return technical_heading.sub(lambda match: f"{match.group(1)}{block}", report_content, count=1)
+
+    return f"{report_content.rstrip()}{build_kline_embed_block(stock_code, heading_level=2)}"
 
 
 def truncate_report_at_baseline_time(report_content: str, current_time_info: str) -> str:
@@ -431,8 +481,9 @@ async def summary_agent(state: AgentState) -> Dict[str, Any]:
         final_report = final_report.replace(
             "```markdown", "").replace("```", "").strip()
         
-        # 使用正则表达式截断"分析基准时间"那一行之后的内容
-        final_report = truncate_report_at_baseline_time(final_report, current_time_info)
+        # Keep the full report. The model may mention the baseline time near the
+        # beginning, so truncating at that line can accidentally delete later sections.
+        final_report = insert_kline_embed_block(final_report, stock_code)
 
         logger.info(
             f"{SUCCESS_ICON} SummaryAgent: Final report generated for {company_name} ({stock_code}).")

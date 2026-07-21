@@ -222,19 +222,6 @@ async def news_agent(state: AgentState) -> AgentState:
                 print("ReAct 完整消息轨迹")
                 print("=" * 80)
 
-                for index, message in enumerate(response.get("messages", []), start=1):
-                    print(f"\n[{index}] 类型: {type(message).__name__}")
-                    print(f"内容: {getattr(message, 'content', '')}")
-
-                    tool_calls = getattr(message, "tool_calls", None)
-                    if tool_calls:
-                        print("工具调用:")
-                        print(json.dumps(
-                            tool_calls,
-                            ensure_ascii=False,
-                            indent=2,
-                            default=str,
-                        ))
             # 退出 async with 后 MCP session 才关闭。
             # 此时 Agent 的全部工具调用已经执行完毕。
             end_time = time.time()
@@ -301,7 +288,9 @@ async def news_agent(state: AgentState) -> AgentState:
                 f"Final extracted analysis length: "
                 f"{len(final_output)} characters"
             )
-            print(f"NEWSAGENT: {final_output}")
+            print("::agent-output-start news", flush=True)
+            print(final_output, flush=True)
+            print("::agent-output-end news", flush=True)
 
             # 7. 记录LLM交互，用于后续分析和优化
             model_config = {
@@ -454,104 +443,6 @@ async def test_news_agent():
     company_name = "嘉友国际"
     stock_code = "sh.603871"
 
-    # 是否继续运行完整 NewsAgent。
-    # 先保持 False，只检查 crawl_news 原始结果。
-    run_full_agent = True
-
-    print("\n" + "=" * 80)
-    print("第一阶段：直接测试 crawl_news MCP Tool")
-    print("=" * 80)
-
-    try:
-        async with get_mcp_tools() as all_mcp_tools:
-            tool_names = [tool.name for tool in all_mcp_tools]
-
-            print(f"\nMCP Server 共加载 {len(all_mcp_tools)} 个工具：")
-            print(tool_names)
-
-            news_tool = next(
-                (
-                    tool
-                    for tool in all_mcp_tools
-                    if tool.name == "crawl_news"
-                ),
-                None,
-            )
-
-            if news_tool is None:
-                raise RuntimeError(
-                    "MCP Server 中没有找到 crawl_news 工具"
-                )
-
-            print("\n找到工具：crawl_news")
-            print(f"工具类型：{type(news_tool)}")
-            print(
-                "参数 Schema：",
-                getattr(news_tool, "args_schema", None),
-            )
-
-            tool_args = {
-                "query": f"{company_name} 最新新闻",
-                "top_k": 10,
-            }
-
-            print("\n即将调用 crawl_news：")
-            print(json.dumps(
-                tool_args,
-                ensure_ascii=False,
-                indent=2,
-            ))
-
-            # 防止爬虫一直卡住
-            raw_result = await asyncio.wait_for(
-                news_tool.ainvoke(tool_args),
-                timeout=60,
-            )
-
-            print("\n" + "-" * 80)
-            print("crawl_news 原始返回")
-            print("-" * 80)
-
-            print(f"返回类型：{type(raw_result)}")
-            print(f"repr：{repr(raw_result)}")
-
-            if isinstance(raw_result, (dict, list)):
-                print("\nJSON 格式化结果：")
-                print(json.dumps(
-                    raw_result,
-                    ensure_ascii=False,
-                    indent=2,
-                    default=str,
-                ))
-            else:
-                result_text = str(raw_result)
-
-                print(f"\n字符串长度：{len(result_text)}")
-                print("\n完整内容：")
-                print(result_text)
-
-            print("-" * 80)
-
-    except asyncio.TimeoutError:
-        print(
-            "\n[测试失败] crawl_news 调用超过 60 秒，"
-            "可能是爬虫请求阻塞、网站响应过慢或被反爬。"
-        )
-        return None
-
-    except Exception as exc:
-        print("\n[测试失败] crawl_news 直接调用出现异常：")
-        print(f"异常类型：{type(exc).__name__}")
-        print(f"异常内容：{exc}")
-        raise
-
-    # 先只测工具，避免再次进入 ReAct 死循环
-    if not run_full_agent:
-        print(
-            "\n已跳过完整 NewsAgent 测试。"
-            "\n请先检查上面的 crawl_news 原始返回结果。"
-        )
-        return raw_result
 
     print("\n" + "=" * 80)
     print("第二阶段：运行完整 NewsAgent")

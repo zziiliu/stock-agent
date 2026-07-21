@@ -1,4 +1,4 @@
-"""
+﻿"""
 指数相关工具，用于MCP服务器
 包含获取指数成分股的工具
 """
@@ -7,7 +7,7 @@ from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 from src.data_source_interface import FinancialDataSource
-from src.tools.base import call_index_constituent_tool
+from src.tools.base import call_index_constituent_tool, call_with_baostock_auth_retry
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,7 @@ def register_index_tools(app: FastMCP, active_data_source: FinancialDataSource):
         logger.info(log_msg)
         try:
             # 如果需要，可以添加日期验证
-            df = active_data_source.get_stock_industry(code=code, date=date)
+            df = call_with_baostock_auth_retry("get_stock_industry", lambda: active_data_source.get_stock_industry(code=code, date=date))
             logger.info(
                 f"Successfully retrieved industry data for {code or 'all'}, {date or 'latest'}.")
             from src.formatting.markdown_formatter import format_df_to_markdown
@@ -101,3 +101,4 @@ def register_index_tools(app: FastMCP, active_data_source: FinancialDataSource):
             "中证500",
             date
         )
+

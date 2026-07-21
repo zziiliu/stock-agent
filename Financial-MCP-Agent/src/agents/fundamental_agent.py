@@ -25,6 +25,25 @@ load_dotenv(override=True)
 logger = setup_logger(__name__)
 
 
+def format_conversation_history(history: Any) -> str:
+    if not isinstance(history, list) or not history:
+        return ""
+
+    lines = []
+    for item in history[-6:]:
+        if not isinstance(item, dict):
+            continue
+
+        role = "用户" if item.get("role") == "user" else "基本面 Agent"
+        content = str(item.get("content", "")).strip()
+        if not content:
+            continue
+
+        lines.append(f"{role}: {content[:1200]}")
+
+    return "\n\n".join(lines)
+
+
 async def fundamental_agent(state: AgentState) -> AgentState:
     """
     使用ReAct框架进行基本面分析，直接集成MCP工具
@@ -203,10 +222,23 @@ async def fundamental_agent(state: AgentState) -> AgentState:
                     "未知日期",
                 )
 
+                history_context = format_conversation_history(
+                    current_data.get("conversation_history", [])
+                )
+                history_section = ""
+                if history_context:
+                    history_section = f"""
+历史对话上下文（用于理解用户本轮追问；如果本轮没有明确股票代码，优先沿用历史中的股票标的）：
+{history_context}
+
+注意：历史上下文只用于理解用户意图和延续话题，最新财务数据仍应通过工具重新获取。
+"""
+
                 agent_input = f"""请分析{company_name}（股票代码：{stock_code}）的基本面情况。
 
 当前时间：{current_time_info}
 当前日期：{current_date}
+{history_section}
 
 请进行以下基本面分析：
 1. 获取公司基本信息和行业背景
@@ -318,7 +350,9 @@ async def fundamental_agent(state: AgentState) -> AgentState:
 
             logger.info(
                 f"Final extracted analysis length: {len(final_output)} characters")
-            print(f"FUNDAMENTALAGENT: {final_output}")
+            print("::agent-output-start fundamental", flush=True)
+            print(final_output, flush=True)
+            print("::agent-output-end fundamental", flush=True)
             # 7. 记录LLM交互，用于后续分析和优化
             model_config = {
                 "model": model_name,
