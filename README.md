@@ -2,7 +2,9 @@
 
 **一个面向 A 股研究的多 Agent 投资分析工作台。**
 
-![Finance Agent Web Console](docs/images/finance-agent-web-console.png)
+![Finance Agent Web Console - 流式分析报告](docs/images/finance-agent-report-stream.png)
+
+![Finance Agent Web Console - K 线与完整报告](docs/images/finance-agent-kline-view.png)
 
 Finance Agent 试图把投研工作里最耗耐心的部分交给 Agent：从公开市场数据中抽取线索，调用 MCP 工具完成财务、行情与新闻检索，再把分析过程和最终报告以对话式界面呈现出来。
 
