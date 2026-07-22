@@ -13,16 +13,22 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-
+from dotenv import load_dotenv
 
 BACKEND_DIR = Path(__file__).resolve().parent
 VUE_DIR = BACKEND_DIR.parent
 FINANCE_DIR = Path(os.environ.get("FINANCE_DIR", VUE_DIR.parent)).resolve()
 AGENT_DIR = FINANCE_DIR / "Financial-MCP-Agent"
+AGENT_ENV_PATH = AGENT_DIR / ".env"
+load_dotenv(
+    dotenv_path=AGENT_ENV_PATH,
+    override=False,
+)
+
 REPORTS_DIR = AGENT_DIR / "reports"
 RUNS_DIR = BACKEND_DIR / "runs"
 PENDING_RUNS: dict[str, RunRequest] = {}
@@ -32,6 +38,22 @@ AGENT_OUTPUT_START = "::agent-output-start "
 AGENT_OUTPUT_END = "::agent-output-end "
 MAX_SESSION_MESSAGES = 12
 MAX_SESSION_CONTENT_CHARS = 5000
+GENERIC_MARKET_SUBJECTS = {
+    "a股",
+    "股票",
+    "科创板",
+    "创业板",
+    "主板",
+    "北交所",
+    "上交所",
+    "深交所",
+    "沪市",
+    "深市",
+    "港股",
+    "美股",
+    "板块",
+    "行业",
+}
 
 
 def chunk_text(text: str, chunk_size: int = 180):
@@ -166,6 +188,12 @@ def choose_agent_python() -> str:
     return sys.executable
 
 
+def ensure_agent_import_path() -> None:
+    agent_path = str(AGENT_DIR)
+    if agent_path not in sys.path:
+        sys.path.insert(0, agent_path)
+
+
 def new_report_since(before_mtimes: dict[str, float]) -> Path | None:
     for item in report_items():
         filename = item["filename"]
@@ -196,6 +224,10 @@ def append_session_memory(conversation_id: str, command: str, response: str) -> 
 
 
 def extract_stock_code_from_command(command: str) -> str | None:
+    prefixed_match = re.search(r"\b(?:sh|sz)\.(\d{6})\b", command.lower())
+    if prefixed_match:
+        return prefixed_match.group(1)
+
     bracket_match = re.search(r"[（(](\d{6})[)）]", command)
     if bracket_match:
         return bracket_match.group(1)
@@ -203,6 +235,22 @@ def extract_stock_code_from_command(command: str) -> str | None:
     code_match = re.search(r"\b(\d{6})\b", command)
     if code_match:
         return code_match.group(1)
+
+    return None
+
+
+def extract_stock_code_from_generated_text(text: str) -> str | None:
+    def is_example_match(match: re.Match[str]) -> bool:
+        prefix = text[max(0, match.start() - 18) : match.start()]
+        return any(marker in prefix for marker in ("例如", "比如", "示例", "格式", "如：", "如:"))
+
+    for prefixed_match in re.finditer(r"\b(?:sh|sz)\.(\d{6})\b", text.lower()):
+        if not is_example_match(prefixed_match):
+            return prefixed_match.group(1)
+
+    for bracket_match in re.finditer(r"[（(](\d{6})[)）]", text):
+        if not is_example_match(bracket_match):
+            return bracket_match.group(1)
 
     return None
 
@@ -220,6 +268,152 @@ def extract_stock_code_from_history(history: list[dict[str, str]]) -> str | None
     return None
 
 
+def is_generic_market_subject(subject: str | None) -> bool:
+    if not subject:
+        return False
+
+    normalized = subject.strip().lower()
+    normalized = normalized.strip("，。,.！？!?：:；; ")
+    for word in ("的", "这个", "这只", "这支", "一下", "看看", "帮我", "分析"):
+        normalized = normalized.replace(word, "").strip()
+
+    return normalized in GENERIC_MARKET_SUBJECTS
+
+
+def extract_stock_subject_from_command(command: str) -> str | None:
+    patterns = (
+        r"(?:帮我看看|给我看看|看看|分析一下|分析|研究一下|评估一下|聊聊)\s*([^0-9（）()\s，。,.！？!?]+)",
+        r"([^0-9（）()\s，。,.！？!?]+)\s*(?:这只|这个|这支|的)?\s*股票",
+        r"^([^0-9（）()\s，。,.！？!?]{2,12})(?:的)?(?:基本面|财务|分红|现金流|估值|风险|盈利|成长|负债|行业|情况|相关|相关话题|怎么样|怎么看|能买吗|还能买吗|能不能买|值得买吗|值得投资吗)",
+    )
+    follow_up_pronouns = (
+        "它",
+        "其",
+        "该股",
+        "这只",
+        "这支",
+        "这个",
+        "这家公司",
+        "这个公司",
+    )
+
+    for pattern in patterns:
+        match = re.search(pattern, command)
+        if not match:
+            continue
+
+        subject = match.group(1).strip()
+        if subject.startswith(follow_up_pronouns) or is_generic_market_subject(subject):
+            return None
+
+        for term in (
+            "基本面",
+            "财务",
+            "分红",
+            "现金流",
+            "估值",
+            "风险",
+            "盈利",
+            "成长",
+            "负债",
+            "行业",
+            "情况",
+            "相关话题",
+            "相关",
+            "怎么样",
+            "怎么看",
+            "能买吗",
+            "还能买吗",
+            "能不能买",
+            "值得买吗",
+            "值得投资吗",
+        ):
+            if term in subject:
+                subject = subject.split(term, 1)[0].strip()
+
+        for word in ("的", "这个", "这只", "这支", "一下", "看看", "帮我", "分析"):
+            subject = subject.replace(word, "").strip()
+
+        if len(subject) >= 2:
+            if is_generic_market_subject(subject):
+                return None
+            return subject
+
+    return None
+
+
+def is_follow_up_stock_question(command: str) -> bool:
+    stripped = command.strip().lower()
+    if not stripped:
+        return False
+
+    follow_up_markers = (
+        "它",
+        "其",
+        "该股",
+        "这只",
+        "这支",
+        "这只股票",
+        "这支股票",
+        "这家公司",
+        "这个公司",
+        "该公司",
+        "拿这支",
+        "拿这只",
+        "拿它",
+        "拿该股",
+        "这支来说",
+        "这只来说",
+        "继续",
+        "接着",
+        "再看",
+        "再看看",
+        "上面",
+        "刚才",
+        "前面",
+        "之前",
+        "上一只",
+    )
+    analysis_terms = (
+        "分红",
+        "现金流",
+        "估值",
+        "风险",
+        "财务",
+        "基本面",
+        "技术面",
+        "盈利",
+        "成长",
+        "负债",
+        "行业",
+        "毛利率",
+        "净利率",
+        "roe",
+        "pe",
+        "pb",
+        "怎么看",
+        "能买吗",
+        "值得",
+    )
+    return any(marker in stripped for marker in follow_up_markers + analysis_terms)
+
+
+def should_reuse_history_stock_for_command(command: str) -> bool:
+    if extract_stock_code_from_command(command):
+        return False
+    if extract_stock_subject_from_command(command):
+        return False
+    return is_follow_up_stock_question(command)
+
+
+def should_preserve_kline_after_run(command: str, state_data: dict[str, Any]) -> bool:
+    if state_data.get("stock_code") or state_data.get("uses_history_stock"):
+        return False
+    if extract_stock_code_from_command(command) or extract_stock_subject_from_command(command):
+        return False
+    return True
+
+
 def normalize_stock_code(code: str) -> str:
     cleaned = code.strip().lower()
     if cleaned.startswith(("sh.", "sz.")):
@@ -232,6 +426,31 @@ def normalize_stock_code(code: str) -> str:
     if digits.startswith(("0", "3")):
         return f"sz.{digits}"
     return digits
+
+
+def resolve_kline_code(
+    command: str,
+    history: list[dict[str, str]] | None = None,
+    stock_code: str | None = None,
+    analysis_text: str | None = None,
+    allow_analysis_text_code: bool = False,
+) -> str | None:
+    if stock_code:
+        return stock_code
+
+    code = extract_stock_code_from_command(command)
+    if code:
+        return code
+
+    if analysis_text and allow_analysis_text_code:
+        code = extract_stock_code_from_generated_text(analysis_text)
+        if code:
+            return code
+
+    if history and should_reuse_history_stock_for_command(command):
+        return extract_stock_code_from_history(history)
+
+    return None
 
 
 def moving_average(values: list[float], window: int) -> list[float | None]:
@@ -417,10 +636,17 @@ def build_kline_option(rows: list[dict[str, Any]], code: str) -> dict[str, Any]:
 async def build_kline_payload(
     command: str,
     history: list[dict[str, str]] | None = None,
+    stock_code: str | None = None,
+    analysis_text: str | None = None,
+    allow_analysis_text_code: bool = False,
 ) -> dict[str, Any] | None:
-    code = extract_stock_code_from_command(command)
-    if not code and history:
-        code = extract_stock_code_from_history(history)
+    code = resolve_kline_code(
+        command,
+        history,
+        stock_code,
+        analysis_text,
+        allow_analysis_text_code=allow_analysis_text_code,
+    )
     if not code:
         return None
 
@@ -484,6 +710,202 @@ async def kline(request: KlineRequest) -> dict[str, Any]:
         "option": option,
         "latest": rows[-1],
     }
+
+
+@app.post("/api/run/fundamental/stream")
+async def stream_fundamental_direct(
+    request: RunRequest,
+    http_request: Request,
+) -> StreamingResponse:
+    async def event_generator():
+        if not AGENT_DIR.exists():
+            yield sse_event("error", {"message": f"Agent dir does not exist: {AGENT_DIR}"})
+            yield sse_event("done", {"message": "failed", "ok": False})
+            return
+
+        ensure_agent_import_path()
+
+        try:
+            from src.agents.fundamental_agent import stream_fundamental_agent
+            from src.single_agent_runner import (
+                build_fundamental_state,
+                write_single_agent_report,
+            )
+            from src.utils.execution_logger import (
+                finalize_execution_logger,
+                initialize_execution_logger,
+            )
+        except Exception as exc:
+            yield sse_event("error", {"message": f"Unable to import Agent modules: {exc}"})
+            yield sse_event("done", {"message": "failed", "ok": False})
+            return
+
+        history = session_history_for(request.conversation_id)[-MAX_SESSION_MESSAGES:]
+        state = build_fundamental_state(request.command.strip(), history)
+        analysis_parts: list[str] = []
+        final_output = ""
+        report_path: Path | None = None
+        logger_initialized = False
+
+        try:
+            RUNS_DIR.mkdir(parents=True, exist_ok=True)
+            initialize_execution_logger(str(AGENT_DIR / "logs"))
+            logger_initialized = True
+
+            yield sse_event(
+                "status",
+                {
+                    "message": "starting",
+                    "command": request.command,
+                    "agent": "fundamental",
+                },
+            )
+            yield sse_event(
+                "agent_status",
+                {
+                    "agent": "fundamental",
+                    "status": "streaming",
+                    "time": datetime.now().isoformat(),
+                },
+            )
+
+            async for item in stream_fundamental_agent(state):
+                if await http_request.is_disconnected():
+                    raise asyncio.CancelledError
+
+                event_name = item.get("event", "status")
+                data = item.get("data", {})
+
+                if event_name == "token":
+                    content = str(data.get("content", ""))
+                    if content:
+                        analysis_parts.append(content)
+                        yield sse_event(
+                            "token",
+                            {
+                                "agent": data.get("agent", "fundamental"),
+                                "content": content,
+                                "time": datetime.now().isoformat(),
+                            },
+                        )
+                    continue
+
+                if event_name == "final":
+                    final_output = str(data.get("content", "")).strip()
+                    continue
+
+                yield sse_event(event_name, data)
+
+            final_output = final_output or "".join(analysis_parts).strip()
+            if final_output:
+                report_path = write_single_agent_report(request.command, final_output)
+                append_session_memory(
+                    request.conversation_id,
+                    request.command,
+                    final_output,
+                )
+
+            if report_path:
+                report_content = read_text(report_path)
+                yield sse_event(
+                    "report",
+                    {
+                        "path": str(report_path),
+                        "content": report_content,
+                    },
+                )
+
+            try:
+                state_data = state.get("data", {})
+                history_for_kline = session_history_for(request.conversation_id)
+                allow_analysis_text_code = bool(
+                    state_data.get("stock_code")
+                    or state_data.get("company_name")
+                    or state_data.get("uses_history_stock")
+                )
+                kline_code = resolve_kline_code(
+                    request.command,
+                    history_for_kline,
+                    stock_code=state_data.get("stock_code"),
+                    analysis_text=final_output,
+                    allow_analysis_text_code=allow_analysis_text_code,
+                )
+                if kline_code:
+                    yield sse_event(
+                        "agent_progress",
+                        {
+                            "agent": "fundamental",
+                            "message": "正在渲染近一个月 K 线。",
+                        },
+                    )
+                kline_payload = await build_kline_payload(
+                    request.command,
+                    history_for_kline,
+                    stock_code=kline_code,
+                    analysis_text=final_output,
+                    allow_analysis_text_code=allow_analysis_text_code,
+                )
+                if kline_payload:
+                    yield sse_event("kline", kline_payload)
+                else:
+                    yield sse_event(
+                        "kline_state",
+                        {
+                            "agent": "fundamental",
+                            "action": "preserve"
+                            if should_preserve_kline_after_run(request.command, state_data)
+                            else "clear",
+                        },
+                    )
+            except Exception as exc:
+                yield sse_event(
+                    "kline_error",
+                    {
+                        "agent": "fundamental",
+                        "message": str(exc) or "K-line data could not be loaded.",
+                    },
+                )
+
+            if logger_initialized:
+                finalize_execution_logger(success=True)
+                logger_initialized = False
+
+            yield sse_event(
+                "done",
+                {
+                    "message": "completed",
+                    "ok": True,
+                    "report_path": str(report_path) if report_path else "",
+                },
+            )
+
+        except asyncio.CancelledError:
+            if logger_initialized:
+                finalize_execution_logger(success=False, error="Client disconnected.")
+            raise
+        except Exception as exc:
+            if logger_initialized:
+                finalize_execution_logger(success=False, error=str(exc))
+            yield sse_event(
+                "agent_status",
+                {
+                    "agent": "fundamental",
+                    "status": "error",
+                    "time": datetime.now().isoformat(),
+                },
+            )
+            yield sse_event("error", {"message": str(exc) or "Agent run failed."})
+            yield sse_event("done", {"message": "failed", "ok": False})
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/api/run/start")
@@ -763,12 +1185,46 @@ async def stream_run(run_id: str) -> StreamingResponse:
 
             if request.agent_mode == "fundamental":
                 try:
+                    state_data = {}
+                    analysis_for_kline = report_content.strip() or "".join(analysis_text_parts).strip()
+                    allow_analysis_text_code = bool(
+                        extract_stock_code_from_command(request.command)
+                        or extract_stock_subject_from_command(request.command)
+                        or should_reuse_history_stock_for_command(request.command)
+                    )
+                    kline_code = resolve_kline_code(
+                        request.command,
+                        session_history_for(request.conversation_id),
+                        analysis_text=analysis_for_kline,
+                        allow_analysis_text_code=allow_analysis_text_code,
+                    )
+                    if kline_code:
+                        yield sse_event(
+                            "agent_progress",
+                            {
+                                "agent": "fundamental",
+                                "message": "正在渲染近一个月 K 线。",
+                            },
+                        )
                     kline_payload = await build_kline_payload(
                         request.command,
                         session_history_for(request.conversation_id),
+                        stock_code=kline_code,
+                        analysis_text=analysis_for_kline,
+                        allow_analysis_text_code=allow_analysis_text_code,
                     )
                     if kline_payload:
                         yield sse_event("kline", kline_payload)
+                    else:
+                        yield sse_event(
+                            "kline_state",
+                            {
+                                "agent": "fundamental",
+                                "action": "preserve"
+                                if should_preserve_kline_after_run(request.command, state_data)
+                                else "clear",
+                            },
+                        )
                 except Exception as exc:
                     yield sse_event(
                         "kline_error",

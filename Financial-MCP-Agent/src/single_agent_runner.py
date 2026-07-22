@@ -29,6 +29,22 @@ AGENT_DIR = Path(__file__).resolve().parents[1]
 REPORTS_DIR = AGENT_DIR / "reports"
 MAX_HISTORY_MESSAGES = 12
 MAX_HISTORY_CONTENT_CHARS = 2500
+GENERIC_MARKET_SUBJECTS = {
+    "a股",
+    "股票",
+    "科创板",
+    "创业板",
+    "主板",
+    "北交所",
+    "上交所",
+    "深交所",
+    "沪市",
+    "深市",
+    "港股",
+    "美股",
+    "板块",
+    "行业",
+}
 
 
 def load_conversation_history() -> list[dict[str, str]]:
@@ -79,6 +95,7 @@ def extract_stock_info(query: str) -> tuple[Optional[str], Optional[str]]:
             r"分析一下\s*([^0-9（）()\s]+)",
             r"分析\s*([^0-9（）()\s]+)",
             r"([^0-9（）()\s]+)\s*(?:这只|这个|的)?\s*股票",
+            r"^([^0-9（）()\s，。,.！？!?]{2,12})(?:的)?(?:基本面|财务|分红|现金流|估值|风险|盈利|成长|负债|行业|情况|相关|相关话题|怎么样|怎么看|能买吗|还能买吗|能不能买|值得买吗|值得投资吗)",
         ]
         for pattern in name_patterns:
             match = re.search(pattern, query)
@@ -87,12 +104,57 @@ def extract_stock_info(query: str) -> tuple[Optional[str], Optional[str]]:
                 break
 
     if company_name:
+        if (
+            company_name.startswith(("它", "其", "该股", "这只", "这支", "这个", "这家公司", "这个公司"))
+            or is_generic_market_subject(company_name)
+        ):
+            company_name = None
+        else:
+            for term in (
+                "基本面",
+                "财务",
+                "分红",
+                "现金流",
+                "估值",
+                "风险",
+                "盈利",
+                "成长",
+                "负债",
+                "行业",
+                "情况",
+                "相关话题",
+                "相关",
+                "怎么样",
+                "怎么看",
+                "能买吗",
+                "还能买吗",
+                "能不能买",
+                "值得买吗",
+                "值得投资吗",
+            ):
+                if term in company_name:
+                    company_name = company_name.split(term, 1)[0].strip()
         for word in ("的", "这个", "这只", "一下", "看看", "帮我", "分析"):
-            company_name = company_name.replace(word, "").strip()
-        if len(company_name) < 2:
+            if company_name:
+                company_name = company_name.replace(word, "").strip()
+        if not company_name or len(company_name) < 2:
+            company_name = None
+        elif is_generic_market_subject(company_name):
             company_name = None
 
     return company_name, stock_code
+
+
+def is_generic_market_subject(subject: Optional[str]) -> bool:
+    if not subject:
+        return False
+
+    normalized = subject.strip().lower()
+    normalized = normalized.strip("，。,.！？!?：:；; ")
+    for word in ("的", "这个", "这只", "这支", "一下", "看看", "帮我", "分析"):
+        normalized = normalized.replace(word, "").strip()
+
+    return normalized in GENERIC_MARKET_SUBJECTS
 
 
 def normalize_stock_code(stock_code: Optional[str]) -> Optional[str]:
@@ -148,6 +210,72 @@ def extract_stock_info_from_history(
     return None, fallback_code
 
 
+def is_follow_up_stock_question(command: str) -> bool:
+    stripped = command.strip().lower()
+    if not stripped:
+        return False
+
+    follow_up_markers = (
+        "它",
+        "其",
+        "该股",
+        "这只",
+        "这支",
+        "这只股票",
+        "这支股票",
+        "这家公司",
+        "这个公司",
+        "该公司",
+        "拿这支",
+        "拿这只",
+        "拿它",
+        "拿该股",
+        "这支来说",
+        "这只来说",
+        "继续",
+        "接着",
+        "再看",
+        "再看看",
+        "上面",
+        "刚才",
+        "前面",
+        "之前",
+        "上一只",
+    )
+    analysis_terms = (
+        "分红",
+        "现金流",
+        "估值",
+        "风险",
+        "财务",
+        "基本面",
+        "技术面",
+        "盈利",
+        "成长",
+        "负债",
+        "行业",
+        "毛利率",
+        "净利率",
+        "roe",
+        "pe",
+        "pb",
+        "怎么看",
+        "能买吗",
+        "值得",
+    )
+    return any(marker in stripped for marker in follow_up_markers + analysis_terms)
+
+
+def should_reuse_history_stock(
+    command: str,
+    company_name: Optional[str],
+    stock_code: Optional[str],
+) -> bool:
+    if company_name or stock_code:
+        return False
+    return is_follow_up_stock_question(command)
+
+
 def write_single_agent_report(command: str, analysis: str) -> Optional[Path]:
     if not analysis.strip():
         return None
@@ -164,58 +292,70 @@ def write_single_agent_report(command: str, analysis: str) -> Optional[Path]:
     return path
 
 
+def build_fundamental_state(
+    command: str,
+    conversation_history: Optional[list[dict[str, str]]] = None,
+) -> AgentState:
+    history = conversation_history if conversation_history is not None else load_conversation_history()
+    company_name, stock_code = extract_stock_info(command)
+    reuse_history_stock = bool(
+        history and should_reuse_history_stock(command, company_name, stock_code)
+    )
+    prompt_history = history
+
+    if reuse_history_stock:
+        history_company, history_code = extract_stock_info_from_history(history)
+        company_name = company_name or history_company
+        stock_code = stock_code or history_code
+
+    current_datetime = datetime.now()
+    current_date_cn = current_datetime.strftime("%Y年%m月%d日")
+    current_date_en = current_datetime.strftime("%Y-%m-%d")
+    current_weekday_cn = [
+        "星期一",
+        "星期二",
+        "星期三",
+        "星期四",
+        "星期五",
+        "星期六",
+        "星期日",
+    ][current_datetime.weekday()]
+    current_time = current_datetime.strftime("%H:%M:%S")
+    current_time_info = (
+        f"{current_date_cn} ({current_date_en}) "
+        f"{current_weekday_cn} {current_time}"
+    )
+
+    initial_data = {
+        "query": command,
+        "current_date": current_date_en,
+        "current_date_cn": current_date_cn,
+        "current_time": current_time,
+        "current_weekday_cn": current_weekday_cn,
+        "current_time_info": current_time_info,
+        "analysis_timestamp": current_datetime.isoformat(),
+        "conversation_history": prompt_history,
+        "uses_history_stock": reuse_history_stock,
+    }
+
+    if company_name:
+        initial_data["company_name"] = company_name
+    if stock_code:
+        initial_data["stock_code"] = normalize_stock_code(stock_code)
+
+    return AgentState(
+        messages=[],
+        data=initial_data,
+        metadata={},
+    )
+
+
 async def run_fundamental_agent(command: str) -> int:
     load_dotenv(override=True)
     execution_logger = initialize_execution_logger()
 
     try:
-        conversation_history = load_conversation_history()
-        company_name, stock_code = extract_stock_info(command)
-        if conversation_history and (not company_name or not stock_code):
-            history_company, history_code = extract_stock_info_from_history(conversation_history)
-            company_name = company_name or history_company
-            stock_code = stock_code or history_code
-
-        current_datetime = datetime.now()
-        current_date_cn = current_datetime.strftime("%Y年%m月%d日")
-        current_date_en = current_datetime.strftime("%Y-%m-%d")
-        current_weekday_cn = [
-            "星期一",
-            "星期二",
-            "星期三",
-            "星期四",
-            "星期五",
-            "星期六",
-            "星期日",
-        ][current_datetime.weekday()]
-        current_time = current_datetime.strftime("%H:%M:%S")
-        current_time_info = (
-            f"{current_date_cn} ({current_date_en}) "
-            f"{current_weekday_cn} {current_time}"
-        )
-
-        initial_data = {
-            "query": command,
-            "current_date": current_date_en,
-            "current_date_cn": current_date_cn,
-            "current_time": current_time,
-            "current_weekday_cn": current_weekday_cn,
-            "current_time_info": current_time_info,
-            "analysis_timestamp": current_datetime.isoformat(),
-            "conversation_history": conversation_history,
-        }
-
-        if company_name:
-            initial_data["company_name"] = company_name
-        if stock_code:
-            initial_data["stock_code"] = normalize_stock_code(stock_code)
-
-        state = AgentState(
-            messages=[],
-            data=initial_data,
-            metadata={},
-        )
-
+        state = build_fundamental_state(command)
         result = await fundamental_agent(state)
         analysis = result.get("data", {}).get("fundamental_analysis", "")
         report_path = write_single_agent_report(command, analysis)

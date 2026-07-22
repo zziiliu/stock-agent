@@ -4,10 +4,10 @@ FundamentalAnalysis Agent: Performs fundamental analysis of a stock using ReAct 
 """
 import os
 import json
-from typing import Dict, Any, List, Optional
+from typing import AsyncIterator, Dict, Any, List, Optional
 from langchain_core.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, BaseMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, AIMessageChunk, BaseMessage
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.outputs import ChatResult, ChatGeneration
 from langgraph.prebuilt import create_react_agent
@@ -42,6 +42,501 @@ def format_conversation_history(history: Any) -> str:
         lines.append(f"{role}: {content[:1200]}")
 
     return "\n\n".join(lines)
+
+
+def build_fundamental_agent_input(current_data: Dict[str, Any]) -> str:
+    user_query = current_data.get("query", "")
+
+    stock_code = current_data.get(
+        "stock_code",
+        "Unknown",
+    )
+
+    company_name = current_data.get(
+        "company_name",
+        "Unknown",
+    )
+
+    current_time_info = current_data.get(
+        "current_time_info",
+        "未知时间",
+    )
+
+    current_date = current_data.get(
+        "current_date",
+        "未知日期",
+    )
+
+    history_section = ""
+    if current_data.get("conversation_history"):
+        history_section = """
+最近对话历史已作为独立消息提供。请结合历史理解用户本轮追问；如果本轮提到新的公司或股票主题，以本轮问题为准。
+"""
+
+    has_stock_target = company_name != "Unknown" or stock_code != "Unknown"
+    if not has_stock_target:
+        return f"""用户本轮问题：{user_query}
+
+当前时间：{current_time_info}
+当前日期：{current_date}
+{history_section}
+
+本轮用户没有提供明确股票标的，也不是对上一只股票的明确追问。请不要调用任何股票数据工具，不要默认沿用历史股票。请用简短自然语言回应；如果用户想做基本面分析，请提醒用户补充股票名称或股票代码。"""
+
+    return f"""用户本轮问题：{user_query}
+
+当前时间：{current_time_info}
+当前日期：{current_date}
+{history_section}
+
+当前关注标的：{company_name}（股票代码：{stock_code}）
+
+如果股票代码为 Unknown，但公司名明确：不要从历史对话中拿旧股票代码补全。只有在非常确定该公司唯一对应的 A 股代码时才调用工具；不确定时先请用户补充股票代码。
+
+请先判断用户本轮问题类型：
+- 如果用户要求完整基本面、财务质量、投资价值或“这只股票怎么样”，再执行完整基本面分析。
+- 如果用户是在上一轮基础上追问某个具体点，例如“科创板股票有什么特殊”“拿这支来说”“分红怎么样”“风险是什么”，请围绕本轮问题回答，并结合当前关注标的，不要要求用户重复股票代码。
+- 如果用户只是寒暄、确认、感谢或闲聊，请自然简短回复，不要调用股票数据工具。
+
+完整基本面分析时可按以下方向展开：
+1. 获取公司基本信息和行业背景
+2. 获取最新财务报表数据（资产负债表、利润表、现金流量表）
+3. 分析盈利能力指标（毛利率、净利率、ROE等）
+4. 分析成长能力指标（收入增长率、利润增长率等）
+5. 分析运营效率指标（应收周转率、存货周转率等）
+6. 分析偿债能力指标（资产负债率、流动比率等）
+7. 查询历史分红情况
+8. 提供基本面综合评估和投资价值分析
+
+重要限制：请专注于财务数据和基本面指标分析，不要使用crawl_news工具获取新闻信息。基本面分析应该基于财务报表、财务指标和公司基本面数据，而不是新闻事件。
+
+图表说明：如果本轮能识别出股票代码，后端会在报告正文后自动渲染近一个月 K 线图。不要在正文里伪造图片、链接或用表格替代 K 线图；可以在结尾简短提示“K 线图见下方”。
+
+需要数据支撑时请使用可用工具获取实际数据，不要基于假设。如果某些数据无法获取，最多再调用3次工具。若某个工具没有返回有效数据，不要反复更换年份、季度或参数重试，直接说明该项数据暂缺。"""
+
+
+def tool_progress_message(tool_name: str) -> str:
+    messages = {
+        "get_stock_basic_info": "正在获取公司基本信息。",
+        "get_stock_industry": "正在获取行业分类信息。",
+        "get_profit_data": "正在获取盈利能力数据。",
+        "get_operation_data": "正在获取运营效率数据。",
+        "get_growth_data": "正在获取成长能力数据。",
+        "get_balance_data": "正在获取资产负债数据。",
+        "get_cash_flow_data": "正在获取现金流数据。",
+        "get_dupont_data": "正在获取杜邦分析数据。",
+        "get_dividend_data": "正在获取历史分红数据。",
+        "get_performance_express_report": "正在获取业绩快报数据。",
+        "get_forecast_report": "正在获取业绩预告数据。",
+    }
+    return messages.get(tool_name, f"正在调用工具：{tool_name}")
+
+
+def chunk_text_content(message: BaseMessage) -> str:
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        return "".join(parts)
+    return ""
+
+
+def build_recent_conversation_messages(history: Any) -> List[BaseMessage]:
+    if not isinstance(history, list):
+        return []
+
+    messages: List[BaseMessage] = []
+    for item in history[-8:]:
+        if not isinstance(item, dict):
+            continue
+
+        role = item.get("role")
+        content = str(item.get("content", "")).strip()
+        if not content:
+            continue
+
+        if role == "user":
+            messages.append(HumanMessage(content=content[:900]))
+        elif role == "assistant":
+            messages.append(AIMessage(content=content[:1800]))
+
+    return messages
+
+
+def build_fundamental_system_message(current_data: Dict[str, Any]) -> SystemMessage:
+    company_name = current_data.get("company_name") or "未明确"
+    stock_code = current_data.get("stock_code") or "未明确"
+    current_time_info = current_data.get("current_time_info", "未知时间")
+
+    return SystemMessage(
+        content=f"""你是一个 A 股基本面 Agent，正在进行多轮投资咨询。
+
+当前时间：{current_time_info}
+当前关注标的：{company_name}（股票代码：{stock_code}）
+
+多轮对话规则：
+1. 最近几轮用户和助手消息会作为独立 message 提供，请把它们当作真实对话历史，而不是普通文本资料。
+2. 当用户说“它”“该股”“这只”“这支”“这家公司”“拿这支来说”等指代表达时，默认指向当前关注标的。
+3. “科创板”“创业板”“主板”“A股”等是市场或板块，不是具体公司名。用户问这些规则时，如果同时出现“这支/该股/拿这支来说”，请结合当前关注标的回答，不要要求用户重新提供代码。
+4. 如果用户明确提出新的股票名称或代码，以本轮新标的为准，不要用历史股票覆盖。
+5. 如果用户只是感谢、确认或普通闲聊，请自然回复，不要调用股票数据工具。
+6. 对需要事实数据支撑的问题，优先调用可用工具；对制度、板块规则、解释性问题，可以结合公开常识和当前标的直接回答。"""
+    )
+
+
+def serialize_messages_for_log(messages: List[BaseMessage]) -> List[Dict[str, str]]:
+    serialized = []
+    for message in messages:
+        if isinstance(message, SystemMessage):
+            role = "system"
+        elif isinstance(message, HumanMessage):
+            role = "user"
+        elif isinstance(message, AIMessage):
+            role = "assistant"
+        else:
+            role = message.__class__.__name__
+        serialized.append({"role": role, "content": chunk_text_content(message)})
+    return serialized
+
+
+def build_fundamental_messages(current_data: Dict[str, Any]) -> List[BaseMessage]:
+    messages: List[BaseMessage] = [build_fundamental_system_message(current_data)]
+    messages.extend(
+        build_recent_conversation_messages(
+            current_data.get("conversation_history", [])
+        )
+    )
+    messages.append(HumanMessage(content=build_fundamental_agent_input(current_data)))
+    return messages
+
+
+async def stream_fundamental_agent(state: AgentState) -> AsyncIterator[dict[str, Any]]:
+    """Stream real LLM chunks from the fundamental ReAct agent."""
+    logger.info(
+        f"{WAIT_ICON} FundamentalAgent: Starting streaming fundamental analysis."
+    )
+    load_dotenv(override=True)
+
+    execution_logger = get_execution_logger()
+    agent_name = "fundamental_agent"
+
+    current_data = state.get("data", {})
+    current_messages = state.get("messages", [])
+    current_metadata = state.get("metadata", {})
+    user_query = current_data.get("query")
+
+    execution_logger.log_agent_start(agent_name, {
+        "user_query": user_query,
+        "stock_code": current_data.get("stock_code"),
+        "company_name": current_data.get("company_name"),
+        "input_data_keys": list(current_data.keys()),
+        "streaming": True,
+    })
+
+    if not user_query:
+        current_data["fundamental_analysis_error"] = "User query is missing."
+        execution_logger.log_agent_complete(
+            agent_name, current_data, 0, False, "User query is missing"
+        )
+        raise ValueError("User query is missing.")
+
+    agent_start_time = time.time()
+
+    try:
+        api_key = os.getenv("OPENAI_COMPATIBLE_API_KEY")
+        base_url = os.getenv("OPENAI_COMPATIBLE_BASE_URL")
+        model_name = os.getenv("OPENAI_COMPATIBLE_MODEL")
+
+        if not all([api_key, base_url, model_name]):
+            current_data["fundamental_analysis_error"] = "Missing OpenAI environment variables."
+            execution_logger.log_agent_complete(
+                agent_name,
+                current_data,
+                time.time() - agent_start_time,
+                False,
+                "Missing OpenAI environment variables",
+            )
+            raise RuntimeError("Missing OpenAI environment variables.")
+
+        yield {
+            "event": "status",
+            "data": {"message": "正在创建基本面分析模型。"},
+        }
+
+        llm = ChatOpenAI(
+            model=model_name,
+            api_key=api_key,
+            base_url=base_url,
+            temperature=0.3,
+            max_tokens=6000,
+            streaming=True,
+        )
+
+        input_messages = build_fundamental_messages(current_data)
+        logged_input_messages = serialize_messages_for_log(input_messages)
+        agent_input = input_messages[-1].content
+        has_stock_target = bool(
+            current_data.get("stock_code") or current_data.get("company_name")
+        )
+        if not has_stock_target:
+            yield {
+                "event": "agent_status",
+                "data": {"agent": "fundamental", "status": "streaming"},
+            }
+            yield {
+                "event": "status",
+                "data": {"message": "正在生成回复。"},
+            }
+
+            start_time = time.time()
+            streamed_parts: list[str] = []
+            async for message_chunk in llm.astream(input_messages):
+                content = chunk_text_content(message_chunk)
+                if content:
+                    streamed_parts.append(content)
+                    yield {
+                        "event": "token",
+                        "data": {
+                            "agent": "fundamental",
+                            "content": content,
+                        },
+                    }
+
+            execution_time = time.time() - start_time
+            final_output = "".join(streamed_parts).strip()
+            if not final_output:
+                raise RuntimeError("No streamed response generated.")
+
+            execution_logger.log_llm_interaction(
+                agent_name=agent_name,
+                interaction_type="direct_chat_stream",
+                input_messages=logged_input_messages,
+                output_content=final_output,
+                model_config={
+                    "model": model_name,
+                    "temperature": 0.3,
+                    "max_tokens": 6000,
+                    "api_base": base_url,
+                    "streaming": True,
+                },
+                execution_time=execution_time,
+            )
+
+            current_data["fundamental_analysis"] = final_output
+            current_metadata["fundamental_agent_executed"] = True
+            current_metadata["fundamental_agent_timestamp"] = str(time.time())
+            current_metadata["fundamental_agent_execution_time"] = f"{execution_time:.2f} seconds"
+
+            total_execution_time = time.time() - agent_start_time
+            execution_logger.log_agent_complete(
+                agent_name,
+                {
+                    "fundamental_analysis_length": len(final_output),
+                    "analysis_preview": final_output[:500],
+                    "llm_execution_time": execution_time,
+                    "total_execution_time": total_execution_time,
+                    "streamed": True,
+                    "direct_chat": True,
+                },
+                total_execution_time,
+                True,
+            )
+
+            yield {
+                "event": "final",
+                "data": {"agent": "fundamental", "content": final_output},
+            }
+            yield {
+                "event": "agent_status",
+                "data": {"agent": "fundamental", "status": "done"},
+            }
+            return
+
+        yield {
+            "event": "agent_progress",
+            "data": {"agent": "fundamental", "message": "正在连接 A 股数据工具..."},
+        }
+
+        allowed_tool_names = {
+            "get_stock_basic_info",
+            "get_stock_industry",
+            "get_profit_data",
+            "get_operation_data",
+            "get_growth_data",
+            "get_balance_data",
+            "get_cash_flow_data",
+            "get_dupont_data",
+            "get_dividend_data",
+            "get_performance_express_report",
+            "get_forecast_report",
+        }
+
+        async with get_mcp_tools() as all_mcp_tools:
+            mcp_tools = [
+                tool
+                for tool in all_mcp_tools
+                if tool.name in allowed_tool_names
+            ]
+
+            if not mcp_tools:
+                current_data["fundamental_analysis_error"] = "No MCP tools available."
+                execution_logger.log_agent_complete(
+                    agent_name,
+                    current_data,
+                    time.time() - agent_start_time,
+                    False,
+                    "No MCP tools available",
+                )
+                raise RuntimeError("No MCP tools available.")
+
+            yield {
+                "event": "agent_progress",
+                "data": {"agent": "fundamental", "message": "已加载基本面分析工具。"},
+            }
+
+            agent = create_react_agent(
+                llm,
+                mcp_tools,
+            )
+
+            logger.info(f"Agent input: {agent_input}")
+
+            input_data = {
+                "messages": input_messages
+            }
+
+            yield {
+                "event": "agent_status",
+                "data": {"agent": "fundamental", "status": "streaming"},
+            }
+            yield {
+                "event": "status",
+                "data": {"message": "正在执行基本面分析。"},
+            }
+
+            start_time = time.time()
+            streamed_parts: list[str] = []
+            sent_tool_names: set[str] = set()
+            tool_call_count = 0
+            has_seen_tool_call = False
+            allow_direct_answer = not current_data.get("stock_code")
+
+            async for message_chunk, metadata in agent.astream(
+                input_data,
+                config={"recursion_limit": 50},
+                stream_mode="messages",
+            ):
+                if isinstance(message_chunk, AIMessageChunk):
+                    tool_call_chunks = getattr(message_chunk, "tool_call_chunks", None) or []
+                    if tool_call_chunks:
+                        has_seen_tool_call = True
+                        for call_chunk in tool_call_chunks:
+                            tool_name = ""
+                            if isinstance(call_chunk, dict):
+                                tool_name = call_chunk.get("name") or ""
+                            else:
+                                tool_name = getattr(call_chunk, "name", "") or ""
+
+                            if tool_name and tool_name not in sent_tool_names:
+                                sent_tool_names.add(tool_name)
+                                tool_call_count += 1
+                                progress = tool_progress_message(tool_name)
+                                print(f"\n[TOOL CALL #{tool_call_count}] {tool_name}", flush=True)
+                                yield {
+                                    "event": "agent_progress",
+                                    "data": {"agent": "fundamental", "message": progress},
+                                }
+                        continue
+
+                    content = chunk_text_content(message_chunk)
+                    if content and (has_seen_tool_call or allow_direct_answer):
+                        streamed_parts.append(content)
+                        yield {
+                            "event": "token",
+                            "data": {
+                                "agent": "fundamental",
+                                "content": content,
+                            },
+                        }
+
+            execution_time = time.time() - start_time
+            final_output = "".join(streamed_parts).strip()
+            if not final_output:
+                raise RuntimeError("No streamed analysis generated.")
+
+            logger.info(
+                f"Streaming ReAct agent execution completed in {execution_time:.2f} seconds"
+            )
+            logger.info(
+                f"Final streamed analysis length: {len(final_output)} characters"
+            )
+
+            model_config = {
+                "model": model_name,
+                "temperature": 0.3,
+                "max_tokens": 6000,
+                "api_base": base_url,
+                "streaming": True,
+            }
+
+            execution_logger.log_llm_interaction(
+                agent_name=agent_name,
+                interaction_type="react_agent_stream",
+                input_messages=logged_input_messages,
+                output_content=final_output,
+                model_config=model_config,
+                execution_time=execution_time,
+            )
+
+            current_data["fundamental_analysis"] = final_output
+            current_metadata["fundamental_agent_executed"] = True
+            current_metadata["fundamental_agent_timestamp"] = str(time.time())
+            current_metadata["fundamental_agent_execution_time"] = f"{execution_time:.2f} seconds"
+
+            total_execution_time = time.time() - agent_start_time
+            execution_logger.log_agent_complete(
+                agent_name,
+                {
+                    "fundamental_analysis_length": len(final_output),
+                    "analysis_preview": final_output[:500],
+                    "llm_execution_time": execution_time,
+                    "total_execution_time": total_execution_time,
+                    "streamed": True,
+                },
+                total_execution_time,
+                True,
+            )
+
+            yield {
+                "event": "final",
+                "data": {"agent": "fundamental", "content": final_output},
+            }
+            yield {
+                "event": "agent_status",
+                "data": {"agent": "fundamental", "status": "done"},
+            }
+
+    except Exception as e:
+        logger.error(
+            f"{ERROR_ICON} FundamentalAgent: Streaming execution failed: {e}",
+            exc_info=True,
+        )
+        current_data["fundamental_analysis_error"] = str(e)
+        current_metadata["fundamental_agent_error"] = str(e)
+        execution_logger.log_agent_complete(
+            agent_name,
+            current_data,
+            time.time() - agent_start_time,
+            False,
+            str(e),
+        )
+        raise
 
 
 async def fundamental_agent(state: AgentState) -> AgentState:
@@ -202,57 +697,9 @@ async def fundamental_agent(state: AgentState) -> AgentState:
                 )
 
                 # 4. 准备输入数据
-                stock_code = current_data.get(
-                    "stock_code",
-                    "Unknown",
-                )
-
-                company_name = current_data.get(
-                    "company_name",
-                    "Unknown",
-                )
-
-                current_time_info = current_data.get(
-                    "current_time_info",
-                    "未知时间",
-                )
-
-                current_date = current_data.get(
-                    "current_date",
-                    "未知日期",
-                )
-
-                history_context = format_conversation_history(
-                    current_data.get("conversation_history", [])
-                )
-                history_section = ""
-                if history_context:
-                    history_section = f"""
-历史对话上下文（用于理解用户本轮追问；如果本轮没有明确股票代码，优先沿用历史中的股票标的）：
-{history_context}
-
-注意：历史上下文只用于理解用户意图和延续话题，最新财务数据仍应通过工具重新获取。
-"""
-
-                agent_input = f"""请分析{company_name}（股票代码：{stock_code}）的基本面情况。
-
-当前时间：{current_time_info}
-当前日期：{current_date}
-{history_section}
-
-请进行以下基本面分析：
-1. 获取公司基本信息和行业背景
-2. 获取最新财务报表数据（资产负债表、利润表、现金流量表）
-3. 分析盈利能力指标（毛利率、净利率、ROE等）
-4. 分析成长能力指标（收入增长率、利润增长率等）
-5. 分析运营效率指标（应收周转率、存货周转率等）
-6. 分析偿债能力指标（资产负债率、流动比率等）
-7. 查询历史分红情况
-8. 提供基本面综合评估和投资价值分析
-
-重要限制：请专注于财务数据和基本面指标分析，不要使用crawl_news工具获取新闻信息。基本面分析应该基于财务报表、财务指标和公司基本面数据，而不是新闻事件。
-
-请使用可用的工具获取实际数据进行分析，而不是基于假设。如果某些数据无法获取，最多再调用3次工具。若某个工具没有返回有效数据，不要反复更换年份、季度或参数重试，直接说明该项数据暂缺，或者其他问题。只要已经获得公司基本信息、行业信息、盈利能力、成长能力、资产负债、现金流中的至少三类数据，就停止调用工具并输出分析。"""
+                input_messages = build_fundamental_messages(current_data)
+                logged_input_messages = serialize_messages_for_log(input_messages)
+                agent_input = input_messages[-1].content
 
                 logger.info(f"Agent input: {agent_input}")
 
@@ -263,7 +710,7 @@ async def fundamental_agent(state: AgentState) -> AgentState:
 
                 # LangGraph ReAct Agent需要messages格式的输入
                 input_data = {
-                    "messages": [HumanMessage(content=agent_input)]
+                    "messages": input_messages
                 }
 
                 # 调用 Agent执行分析
@@ -364,7 +811,7 @@ async def fundamental_agent(state: AgentState) -> AgentState:
             execution_logger.log_llm_interaction(
                 agent_name=agent_name,
                 interaction_type="react_agent",
-                input_messages=[{"role": "user", "content": agent_input}],
+                input_messages=logged_input_messages,
                 output_content=final_output,
                 model_config=model_config,
                 execution_time=execution_time

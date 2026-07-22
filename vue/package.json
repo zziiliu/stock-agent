@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@lucide/vue": "^1.24.0",
+    "@microsoft/fetch-event-source": "^2.0.1",
     "@vitejs/plugin-vue": "^5.2.1",
     "dompurify": "^3.2.3",
     "echarts": "^6.1.0",

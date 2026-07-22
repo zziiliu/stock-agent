@@ -1,5 +1,6 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from "vue";
+import { fetchEventSource } from "@microsoft/fetch-event-source";
 import {
   AlertTriangle,
   Bot,
@@ -12,6 +13,7 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   Send,
+  Square,
 } from "@lucide/vue";
 import * as echarts from "echarts";
 import { marked } from "marked";
@@ -64,8 +66,24 @@ const klineOption = ref(null);
 const klineMeta = ref(null);
 const klineError = ref("");
 const klineChartEl = ref(null);
+const genericMarketSubjects = new Set([
+  "a股",
+  "股票",
+  "科创板",
+  "创业板",
+  "主板",
+  "北交所",
+  "上交所",
+  "深交所",
+  "沪市",
+  "深市",
+  "港股",
+  "美股",
+  "板块",
+  "行业",
+]);
 
-let runEventSource = null;
+let runAbortController = null;
 let klineChart = null;
 let archivedTurnCounter = 0;
 
@@ -165,10 +183,10 @@ function prepareActiveConversation(prompt) {
   return item.id;
 }
 
-function closeRunEventSource() {
-  if (runEventSource) {
-    runEventSource.close();
-    runEventSource = null;
+function abortRunRequest() {
+  if (runAbortController) {
+    runAbortController.abort();
+    runAbortController = null;
   }
 }
 
@@ -179,18 +197,105 @@ function disposeKlineChart() {
   }
 }
 
-function resetAgentPanels() {
+function clearKline() {
+  klineOption.value = null;
+  klineMeta.value = null;
+  klineError.value = "";
+  disposeKlineChart();
+}
+
+function extractStockSubjectFromPrompt(prompt) {
+  const patterns = [
+    /(?:帮我看看|给我看看|看看|分析一下|分析|研究一下|评估一下|聊聊)\s*([^0-9（）()\s，。,.！？!?]+)/,
+    /([^0-9（）()\s，。,.！？!?]+)\s*(?:这只|这个|这支|的)?\s*股票/,
+    /^([^0-9（）()\s，。,.！？!?]{2,12})(?:的)?(?:基本面|财务|分红|现金流|估值|风险|盈利|成长|负债|行业|情况|相关|相关话题|怎么样|怎么看|能买吗|还能买吗|能不能买|值得买吗|值得投资吗)/,
+  ];
+  const followUpPronouns = /^(它|其|该股|这只|这支|这个|这家公司|这个公司)/;
+
+  for (const pattern of patterns) {
+    const match = prompt.match(pattern);
+    if (!match) continue;
+
+    let subject = match[1].trim();
+    if (followUpPronouns.test(subject) || isGenericMarketSubject(subject)) return "";
+
+    for (const term of [
+      "基本面",
+      "财务",
+      "分红",
+      "现金流",
+      "估值",
+      "风险",
+      "盈利",
+      "成长",
+      "负债",
+      "行业",
+      "情况",
+      "相关话题",
+      "相关",
+      "怎么样",
+      "怎么看",
+      "能买吗",
+      "还能买吗",
+      "能不能买",
+      "值得买吗",
+      "值得投资吗",
+    ]) {
+      if (subject.includes(term)) {
+        subject = subject.split(term)[0].trim();
+      }
+    }
+
+    for (const word of ["的", "这个", "这只", "这支", "一下", "看看", "帮我", "分析"]) {
+      subject = subject.replaceAll(word, "").trim();
+    }
+
+    if (subject.length >= 2 && !isGenericMarketSubject(subject)) return subject;
+  }
+
+  return "";
+}
+
+function isGenericMarketSubject(subject) {
+  if (!subject) return false;
+  let normalized = subject.trim().toLowerCase().replace(/^[，。,.！？!?：:；;\s]+|[，。,.！？!?：:；;\s]+$/g, "");
+  for (const word of ["的", "这个", "这只", "这支", "一下", "看看", "帮我", "分析"]) {
+    normalized = normalized.replaceAll(word, "").trim();
+  }
+  return genericMarketSubjects.has(normalized);
+}
+
+function shouldClearKlineForPrompt(prompt) {
+  if (/\b(?:sh|sz)\.\d{6}\b/i.test(prompt)) return true;
+  if (/[（(]\d{6}[)）]/.test(prompt) || /\b\d{6}\b/.test(prompt)) return true;
+  return Boolean(extractStockSubjectFromPrompt(prompt));
+}
+
+function captureKlineImage() {
+  if (!klineChart || !klineOption.value) return "";
+
+  try {
+    return klineChart.getDataURL({
+      type: "png",
+      pixelRatio: 2,
+      backgroundColor: "#ffffff",
+    });
+  } catch (error) {
+    return "";
+  }
+}
+
+function resetAgentPanels({ clearKlineBeforeRun = false } = {}) {
   for (const definition of agentDefinitions) {
     agents[definition.id].content = "";
     agents[definition.id].progress = [];
     agents[definition.id].status = "waiting";
     agents[definition.id].updatedAt = "";
   }
-  klineOption.value = null;
-  klineMeta.value = null;
-  klineError.value = "";
+  if (clearKlineBeforeRun) {
+    clearKline();
+  }
   copiedAgentId.value = "";
-  disposeKlineChart();
 }
 
 function archiveCurrentTurn() {
@@ -202,6 +307,9 @@ function archiveCurrentTurn() {
     id: `turn-${Date.now()}-${archivedTurnCounter}`,
     prompt,
     content,
+    klineImage: captureKlineImage(),
+    klineMeta: klineMeta.value ? { ...klineMeta.value } : null,
+    klineError: klineError.value,
     time: new Date().toLocaleTimeString(),
   });
   archivedTurnCounter += 1;
@@ -274,6 +382,16 @@ function resizeKlineChart() {
   klineChart?.resize();
 }
 
+function cancelRun() {
+  if (!isRunning.value) return;
+
+  abortRunRequest();
+  isRunning.value = false;
+  runPhase.value = "cancelled";
+  updateActiveConversationStatus("cancelled");
+  finishPendingAgents();
+}
+
 async function copyTextContent(content, copyKey) {
   const text = content?.trim();
   if (!text) return;
@@ -315,8 +433,8 @@ async function runAnalysis() {
   if (!prompt || isRunning.value) return;
 
   archiveCurrentTurn();
-  closeRunEventSource();
-  resetAgentPanels();
+  abortRunRequest();
+  resetAgentPanels({ clearKlineBeforeRun: shouldClearKlineForPrompt(prompt) });
   errorMessage.value = "";
   runPhase.value = "starting";
   isRunning.value = true;
@@ -325,99 +443,143 @@ async function runAnalysis() {
   userInput.value = "";
   scrollToLatest();
 
+  const controller = new AbortController();
+  runAbortController = controller;
+  let streamCompleted = false;
+
   try {
-    const body = await requestJson("/api/run/start", {
+    await fetchEventSource("/api/run/fundamental/stream", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "text/event-stream",
+      },
       body: JSON.stringify({
         command: prompt,
         timeout_seconds: 1800,
         agent_mode: "fundamental",
         conversation_id: conversationId,
       }),
-    });
-
-    runPhase.value = "connected";
-    runEventSource = new EventSource(`/api/run/stream/${body.run_id}`);
-
-    runEventSource.addEventListener("status", (event) => {
-      const data = JSON.parse(event.data);
-      runPhase.value = data.message || "running";
-    });
-
-    runEventSource.addEventListener("agent_status", (event) => {
-      const data = JSON.parse(event.data);
-      setAgentStatus(data.agent, data.status);
-    });
-
-    runEventSource.addEventListener("agent_delta", (event) => {
-      const data = JSON.parse(event.data);
-      appendAgentContent(data.agent, data.content || "");
-    });
-
-    runEventSource.addEventListener("agent_progress", (event) => {
-      const data = JSON.parse(event.data);
-      appendAgentProgress(data.agent, data.message || "");
-    });
-
-    runEventSource.addEventListener("kline", (event) => {
-      const data = JSON.parse(event.data);
-      klineOption.value = data.option || null;
-      klineMeta.value = {
-        code: data.code,
-        count: data.count,
-        latest: data.latest,
-      };
-      klineError.value = "";
-      renderKlineChart();
-    });
-
-    runEventSource.addEventListener("kline_error", (event) => {
-      const data = JSON.parse(event.data);
-      klineError.value = data.message || "K 线数据加载失败。";
-      scrollToLatest();
-    });
-
-    runEventSource.addEventListener("done", (event) => {
-      const data = JSON.parse(event.data);
-      isRunning.value = false;
-      runPhase.value = data.ok ? "done" : "failed";
-      finishPendingAgents();
-      updateActiveConversationStatus(data.ok ? "done" : "failed");
-      closeRunEventSource();
-    });
-
-    runEventSource.addEventListener("server_error", (event) => {
-      const data = JSON.parse(event.data);
-      errorMessage.value = data.message || "Agent run failed";
-      isRunning.value = false;
-      runPhase.value = "failed";
-      updateActiveConversationStatus("failed");
-      for (const definition of agentDefinitions) {
-        if (agents[definition.id].status !== "done") {
-          agents[definition.id].status = "error";
+      signal: controller.signal,
+      openWhenHidden: true,
+      async onopen(response) {
+        const contentType = response.headers.get("content-type") || "";
+        if (!response.ok || !contentType.includes("text/event-stream")) {
+          const body = await response.json().catch(() => ({}));
+          throw new Error(body.detail || `Request failed: ${response.status}`);
         }
-      }
-      closeRunEventSource();
-    });
+        runPhase.value = "connected";
+      },
+      onmessage(event) {
+        const data = event.data ? JSON.parse(event.data) : {};
 
-    runEventSource.addEventListener("error", () => {
-      if (!isRunning.value || runEventSource?.readyState === EventSource.CLOSED) {
-        return;
-      }
+        if (event.event === "status") {
+          runPhase.value = data.message || "running";
+          return;
+        }
 
-      if (runEventSource?.readyState === EventSource.CONNECTING) {
-        runPhase.value = "reconnecting";
-        return;
-      }
+        if (event.event === "agent_status") {
+          setAgentStatus(data.agent || "fundamental", data.status || "streaming");
+          return;
+        }
 
-      if (runEventSource?.readyState === EventSource.OPEN) {
-        return;
-      }
+        if (event.event === "agent_progress") {
+          appendAgentProgress(data.agent || "fundamental", data.message || "");
+          return;
+        }
 
-      runPhase.value = "connection_check";
+        if (event.event === "token") {
+          appendAgentContent(data.agent || "fundamental", data.content || "");
+          return;
+        }
+
+        if (event.event === "kline") {
+          klineOption.value = data.option || null;
+          klineMeta.value = {
+            code: data.code,
+            count: data.count,
+            latest: data.latest,
+          };
+          klineError.value = "";
+          renderKlineChart();
+          return;
+        }
+
+        if (event.event === "kline_state") {
+          if (data.action === "clear") {
+            clearKline();
+          } else {
+            renderKlineChart();
+          }
+          scrollToLatest();
+          return;
+        }
+
+        if (event.event === "kline_error") {
+          clearKline();
+          klineError.value = data.message || "K 线数据加载失败。";
+          scrollToLatest();
+          return;
+        }
+
+        if (event.event === "error") {
+          errorMessage.value = data.message || "Agent run failed";
+          isRunning.value = false;
+          runPhase.value = "failed";
+          updateActiveConversationStatus("failed");
+          for (const definition of agentDefinitions) {
+            if (agents[definition.id].status !== "done") {
+              agents[definition.id].status = "error";
+            }
+          }
+          streamCompleted = true;
+          throw new Error(errorMessage.value);
+        }
+
+        if (event.event === "done") {
+          streamCompleted = true;
+          isRunning.value = false;
+          runPhase.value = data.ok ? "done" : "failed";
+          finishPendingAgents();
+          updateActiveConversationStatus(data.ok ? "done" : "failed");
+          runAbortController = null;
+        }
+      },
+      onclose() {
+        if (!streamCompleted && !controller.signal.aborted) {
+          isRunning.value = false;
+          runPhase.value = "closed";
+          updateActiveConversationStatus("closed");
+          finishPendingAgents();
+        }
+        if (runAbortController === controller) {
+          runAbortController = null;
+        }
+      },
+      onerror(error) {
+        if (controller.signal.aborted) {
+          throw error;
+        }
+
+        errorMessage.value = error.message || "SSE stream error";
+        isRunning.value = false;
+        runPhase.value = "failed";
+        updateActiveConversationStatus("failed");
+        for (const definition of agentDefinitions) {
+          if (agents[definition.id].status !== "done") {
+            agents[definition.id].status = "error";
+          }
+        }
+        if (runAbortController === controller) {
+          runAbortController = null;
+        }
+        throw error;
+      },
     });
   } catch (error) {
+    if (controller.signal.aborted) {
+      return;
+    }
     errorMessage.value = error.message;
     isRunning.value = false;
     runPhase.value = "failed";
@@ -436,7 +598,7 @@ onMounted(async () => {
 });
 
 onBeforeUnmount(() => {
-  closeRunEventSource();
+  abortRunRequest();
   disposeKlineChart();
   window.removeEventListener("resize", resizeKlineChart);
 });
@@ -531,11 +693,31 @@ onBeforeUnmount(() => {
                       <Copy v-else :size="16" />
                     </button>
                   </div>
-                </div>
-              </div>
 
-              <div class="agent-card-foot">
-                <span>{{ turn.time }}</span>
+                  <section
+                    v-if="turn.klineImage || turn.klineError"
+                    class="kline-section kline-section-archived"
+                  >
+                    <div class="kline-head">
+                      <div class="flex items-center gap-2">
+                        <CandlestickChart :size="18" class="text-primary" />
+                        <h3>近一个月 K 线</h3>
+                      </div>
+                      <span v-if="turn.klineMeta" class="kline-meta">
+                        {{ turn.klineMeta.code }} · {{ turn.klineMeta.count }} 条
+                      </span>
+                    </div>
+                    <img
+                      v-if="turn.klineImage"
+                      class="kline-image"
+                      :src="turn.klineImage"
+                      alt="Archived K-line chart"
+                    />
+                    <div v-else class="kline-error">{{ turn.klineError }}</div>
+                  </section>
+
+                  <div class="agent-response-time">{{ turn.time }}</div>
+                </div>
               </div>
             </article>
           </section>
@@ -641,11 +823,10 @@ onBeforeUnmount(() => {
                   等待输出
                 </div>
                 <div class="output-sentinel"></div>
+                <div class="agent-response-time">
+                  {{ agents[definition.id].updatedAt || "未更新" }}
+                </div>
               </div>
-            </div>
-
-            <div class="agent-card-foot">
-              <span>{{ agents[definition.id].updatedAt || "未更新" }}</span>
             </div>
           </article>
         </section>
@@ -662,11 +843,13 @@ onBeforeUnmount(() => {
           ></textarea>
           <button
             class="btn btn-primary join-item composer-send"
-            :disabled="!canSend"
+            :class="{ 'btn-error': isRunning }"
+            :disabled="!isRunning && !canSend"
             type="button"
-            @click="runAnalysis"
+            :title="isRunning ? '取消生成' : '发送'"
+            @click="isRunning ? cancelRun() : runAnalysis()"
           >
-            <LoaderCircle v-if="isRunning" class="spin" :size="18" />
+            <Square v-if="isRunning" :size="18" />
             <Send v-else :size="18" />
           </button>
         </div>
