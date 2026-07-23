@@ -289,10 +289,6 @@ textarea {
   padding-top: 16px;
 }
 
-.kline-section-archived {
-  margin-top: 18px;
-}
-
 .agent-copy-button {
   bottom: 8px;
   color: color-mix(in oklab, var(--color-base-content) 52%, transparent);
@@ -326,12 +322,6 @@ textarea {
   color: var(--color-error);
   font-size: 13px;
   margin-top: 12px;
-}
-
-.kline-image {
-  display: block;
-  margin-top: 12px;
-  width: 100%;
 }
 
 .output-sentinel {

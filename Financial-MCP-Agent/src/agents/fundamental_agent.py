@@ -7,7 +7,7 @@ import json
 from typing import AsyncIterator, Dict, Any, List, Optional
 from langchain_core.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, AIMessageChunk, BaseMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, AIMessageChunk, BaseMessage, ToolMessage
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.outputs import ChatResult, ChatGeneration
 from langgraph.prebuilt import create_react_agent
@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 logger = setup_logger(__name__)
+KLINE_TOOL_NAME = "get_stock_kline_data"
 
 
 def format_conversation_history(history: Any) -> str:
@@ -110,7 +111,15 @@ def build_fundamental_agent_input(current_data: Dict[str, Any]) -> str:
 
 重要限制：请专注于财务数据和基本面指标分析，不要使用crawl_news工具获取新闻信息。基本面分析应该基于财务报表、财务指标和公司基本面数据，而不是新闻事件。
 
-图表说明：如果本轮能识别出股票代码，后端会在报告正文后自动渲染近一个月 K 线图。不要在正文里伪造图片、链接或用表格替代 K 线图；可以在结尾简短提示“K 线图见下方”。
+K 线工具调用规则：
+- 当用户要求完整分析，或问题涉及近期股价走势、价格波动、均线、成交量、技术表现时，可以调用 get_stock_kline_data。
+- 调用 K 线工具前，先用一句简短自然语言说明为什么需要查看走势图。
+- 工具返回后，结合 K 线数据继续输出分析文字，不要只调用工具而不解释结果。
+- 如果用户只是感谢、寒暄、确认或普通闲聊，不要调用 K 线工具。
+- 如果用户询问纯制度性、概念性问题，且不需要具体股票行情，不要调用 K 线工具。
+- 同一轮针对同一只股票通常最多调用一次 K 线工具，除非用户明确要求不同周期或新的股票。
+- 用户没有明确指定周期时，调用 get_stock_kline_data 必须使用 days=30，不要自行扩大到60、90或更长周期。
+- 如果当前股票代码不明确，不要猜代码调用工具。
 
 需要数据支撑时请使用可用工具获取实际数据，不要基于假设。如果某些数据无法获取，最多再调用3次工具。若某个工具没有返回有效数据，不要反复更换年份、季度或参数重试，直接说明该项数据暂缺。"""
 
@@ -128,6 +137,7 @@ def tool_progress_message(tool_name: str) -> str:
         "get_dividend_data": "正在获取历史分红数据。",
         "get_performance_express_report": "正在获取业绩快报数据。",
         "get_forecast_report": "正在获取业绩预告数据。",
+        "get_stock_kline_data": "正在获取近一个月 K 线数据。",
     }
     return messages.get(tool_name, f"正在调用工具：{tool_name}")
 
@@ -136,6 +146,10 @@ def chunk_text_content(message: BaseMessage) -> str:
     content = getattr(message, "content", "")
     if isinstance(content, str):
         return content
+    if isinstance(content, dict):
+        if isinstance(content.get("text"), str):
+            return content["text"]
+        return json.dumps(content, ensure_ascii=False)
     if isinstance(content, list):
         parts = []
         for item in content:
@@ -145,6 +159,89 @@ def chunk_text_content(message: BaseMessage) -> str:
                 parts.append(item["text"])
         return "".join(parts)
     return ""
+
+
+def tool_call_chunk_value(call_chunk: Any, key: str) -> Any:
+    if isinstance(call_chunk, dict):
+        return call_chunk.get(key)
+    return getattr(call_chunk, key, None)
+
+
+def parse_kline_tool_payload(content: str) -> tuple[dict[str, Any] | None, str | None]:
+    text = (content or "").strip()
+    if not text:
+        return None, "K 线工具没有返回内容。"
+    if text.lower().startswith("error:"):
+        return None, text
+
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return None, f"K 线工具返回 JSON 解析失败：{exc}"
+
+    if not isinstance(payload, dict):
+        return None, "K 线工具返回格式错误：顶层不是对象。"
+    if payload.get("type") != "kline":
+        return None, "K 线工具返回格式错误：type 不是 kline。"
+
+    rows = payload.get("rows")
+    if not isinstance(rows, list) or not rows:
+        return None, "K 线工具返回格式错误：rows 为空。"
+
+    code = payload.get("code")
+    if not isinstance(code, str) or not code:
+        return None, "K 线工具返回格式错误：缺少股票代码。"
+
+    return payload, None
+
+
+def kline_tool_result_event(
+    message: ToolMessage,
+    tool_name_by_call_id: dict[str, str],
+    emitted_keys: set[str],
+) -> dict[str, Any] | None:
+    tool_call_id = getattr(message, "tool_call_id", "") or ""
+    tool_name = getattr(message, "name", "") or tool_name_by_call_id.get(tool_call_id, "")
+    if tool_name != KLINE_TOOL_NAME:
+        return None
+
+    content = chunk_text_content(message)
+    payload, error = parse_kline_tool_payload(content)
+    fallback_key = f"{tool_name}:{tool_call_id or content[:80]}"
+
+    if payload:
+        rows = payload.get("rows") or []
+        latest = payload.get("latest") or (rows[-1] if rows else {})
+        dedupe_key = tool_call_id or f"{tool_name}:{payload.get('code')}:{latest.get('date')}"
+        if dedupe_key in emitted_keys:
+            return None
+
+        emitted_keys.add(dedupe_key)
+        return {
+            "event": "kline_data",
+            "data": {
+                "agent": "fundamental",
+                "tool_call_id": tool_call_id,
+                "code": payload.get("code"),
+                "count": payload.get("count") or len(rows),
+                "rows": rows,
+                "latest": latest,
+                "summary": payload.get("summary") or {},
+            },
+        }
+
+    if fallback_key in emitted_keys:
+        return None
+
+    emitted_keys.add(fallback_key)
+    return {
+        "event": "kline_error",
+        "data": {
+            "agent": "fundamental",
+            "tool_call_id": tool_call_id,
+            "message": error or "K 线数据加载失败。",
+        },
+    }
 
 
 def build_recent_conversation_messages(history: Any) -> List[BaseMessage]:
@@ -186,7 +283,9 @@ def build_fundamental_system_message(current_data: Dict[str, Any]) -> SystemMess
 3. “科创板”“创业板”“主板”“A股”等是市场或板块，不是具体公司名。用户问这些规则时，如果同时出现“这支/该股/拿这支来说”，请结合当前关注标的回答，不要要求用户重新提供代码。
 4. 如果用户明确提出新的股票名称或代码，以本轮新标的为准，不要用历史股票覆盖。
 5. 如果用户只是感谢、确认或普通闲聊，请自然回复，不要调用股票数据工具。
-6. 对需要事实数据支撑的问题，优先调用可用工具；对制度、板块规则、解释性问题，可以结合公开常识和当前标的直接回答。"""
+6. 对需要事实数据支撑的问题，优先调用可用工具；对制度、板块规则、解释性问题，可以结合公开常识和当前标的直接回答。
+7. 只有当问题涉及完整分析、近期走势、价格波动、均线、成交量或技术表现时，才调用 get_stock_kline_data；调用前先用一句话说明要查看走势，工具返回后继续解释图中的走势；用户没有明确指定周期时，days 必须使用30。
+8. “谢谢你”“明白了”“好的”等普通回复绝对不要调用 get_stock_kline_data 或其他行情工具。"""
     )
 
 
@@ -375,6 +474,7 @@ async def stream_fundamental_agent(state: AgentState) -> AsyncIterator[dict[str,
             "get_dividend_data",
             "get_performance_express_report",
             "get_forecast_report",
+            KLINE_TOOL_NAME,
         }
 
         async with get_mcp_tools() as all_mcp_tools:
@@ -423,9 +523,9 @@ async def stream_fundamental_agent(state: AgentState) -> AsyncIterator[dict[str,
             start_time = time.time()
             streamed_parts: list[str] = []
             sent_tool_names: set[str] = set()
+            tool_name_by_call_id: dict[str, str] = {}
+            emitted_kline_tool_call_ids: set[str] = set()
             tool_call_count = 0
-            has_seen_tool_call = False
-            allow_direct_answer = not current_data.get("stock_code")
 
             async for message_chunk, metadata in agent.astream(
                 input_data,
@@ -433,15 +533,25 @@ async def stream_fundamental_agent(state: AgentState) -> AsyncIterator[dict[str,
                 stream_mode="messages",
             ):
                 if isinstance(message_chunk, AIMessageChunk):
+                    content = chunk_text_content(message_chunk)
+                    if content:
+                        streamed_parts.append(content)
+                        yield {
+                            "event": "token",
+                            "data": {
+                                "agent": "fundamental",
+                                "content": content,
+                            },
+                        }
+
                     tool_call_chunks = getattr(message_chunk, "tool_call_chunks", None) or []
                     if tool_call_chunks:
-                        has_seen_tool_call = True
                         for call_chunk in tool_call_chunks:
-                            tool_name = ""
-                            if isinstance(call_chunk, dict):
-                                tool_name = call_chunk.get("name") or ""
-                            else:
-                                tool_name = getattr(call_chunk, "name", "") or ""
+                            tool_name = tool_call_chunk_value(call_chunk, "name") or ""
+                            tool_call_id = tool_call_chunk_value(call_chunk, "id") or ""
+
+                            if tool_call_id and tool_name:
+                                tool_name_by_call_id[tool_call_id] = tool_name
 
                             if tool_name and tool_name not in sent_tool_names:
                                 sent_tool_names.add(tool_name)
@@ -452,18 +562,16 @@ async def stream_fundamental_agent(state: AgentState) -> AsyncIterator[dict[str,
                                     "event": "agent_progress",
                                     "data": {"agent": "fundamental", "message": progress},
                                 }
-                        continue
+                    continue
 
-                    content = chunk_text_content(message_chunk)
-                    if content and (has_seen_tool_call or allow_direct_answer):
-                        streamed_parts.append(content)
-                        yield {
-                            "event": "token",
-                            "data": {
-                                "agent": "fundamental",
-                                "content": content,
-                            },
-                        }
+                if isinstance(message_chunk, ToolMessage):
+                    kline_event = kline_tool_result_event(
+                        message_chunk,
+                        tool_name_by_call_id,
+                        emitted_kline_tool_call_ids,
+                    )
+                    if kline_event:
+                        yield kline_event
 
             execution_time = time.time() - start_time
             final_output = "".join(streamed_parts).strip()
@@ -632,6 +740,7 @@ async def fundamental_agent(state: AgentState) -> AgentState:
                 "get_dividend_data",
                 "get_performance_express_report",
                 "get_forecast_report",
+                KLINE_TOOL_NAME,
             }
 
             # get_mcp_tools() 现在是异步上下文管理器。

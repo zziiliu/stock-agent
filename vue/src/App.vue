@@ -4,7 +4,6 @@ import { fetchEventSource } from "@microsoft/fetch-event-source";
 import {
   AlertTriangle,
   Bot,
-  CandlestickChart,
   Check,
   CircleCheck,
   CircleDot,
@@ -15,9 +14,9 @@ import {
   Send,
   Square,
 } from "@lucide/vue";
-import * as echarts from "echarts";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
+import KlineChart from "./components/KlineChart.vue";
 
 marked.setOptions({ breaks: true, gfm: true });
 
@@ -35,7 +34,6 @@ const agents = reactive(
     agentDefinitions.map((agent) => [
       agent.id,
       {
-        content: "",
         progress: [],
         status: "idle",
         updatedAt: "",
@@ -61,37 +59,12 @@ const conversations = ref([
 ]);
 const archivedTurns = ref([]);
 const currentPrompt = ref("");
+const currentBlocks = ref([]);
 const copiedAgentId = ref("");
-const klineOption = ref(null);
-const klineMeta = ref(null);
-const klineError = ref("");
-const klineChartEl = ref(null);
-const genericMarketSubjects = new Set([
-  "a股",
-  "股票",
-  "科创板",
-  "创业板",
-  "主板",
-  "北交所",
-  "上交所",
-  "深交所",
-  "沪市",
-  "深市",
-  "港股",
-  "美股",
-  "板块",
-  "行业",
-]);
 
 let runAbortController = null;
-let klineChart = null;
 let archivedTurnCounter = 0;
-
-function asElement(value) {
-  const candidate = Array.isArray(value) ? value[0] : value;
-  if (!candidate) return null;
-  return candidate instanceof HTMLElement ? candidate : candidate.$el || null;
-}
+let renderedToolCallIds = new Set();
 
 const canSend = computed(() => userInput.value.trim().length > 0 && !isRunning.value);
 
@@ -190,126 +163,87 @@ function abortRunRequest() {
   }
 }
 
-function disposeKlineChart() {
-  if (klineChart) {
-    klineChart.dispose();
-    klineChart = null;
-  }
+function cloneBlocks(blocks) {
+  return JSON.parse(JSON.stringify(blocks));
 }
 
-function clearKline() {
-  klineOption.value = null;
-  klineMeta.value = null;
-  klineError.value = "";
-  disposeKlineChart();
+function blocksTextContent(blocks) {
+  return blocks
+    .filter((block) => block.type === "text")
+    .map((block) => block.content)
+    .join("")
+    .trim();
 }
 
-function extractStockSubjectFromPrompt(prompt) {
-  const patterns = [
-    /(?:帮我看看|给我看看|看看|分析一下|分析|研究一下|评估一下|聊聊)\s*([^0-9（）()\s，。,.！？!?]+)/,
-    /([^0-9（）()\s，。,.！？!?]+)\s*(?:这只|这个|这支|的)?\s*股票/,
-    /^([^0-9（）()\s，。,.！？!?]{2,12})(?:的)?(?:基本面|财务|分红|现金流|估值|风险|盈利|成长|负债|行业|情况|相关|相关话题|怎么样|怎么看|能买吗|还能买吗|能不能买|值得买吗|值得投资吗)/,
-  ];
-  const followUpPronouns = /^(它|其|该股|这只|这支|这个|这家公司|这个公司)/;
+function appendTextBlock(content) {
+  if (!content) return;
 
-  for (const pattern of patterns) {
-    const match = prompt.match(pattern);
-    if (!match) continue;
-
-    let subject = match[1].trim();
-    if (followUpPronouns.test(subject) || isGenericMarketSubject(subject)) return "";
-
-    for (const term of [
-      "基本面",
-      "财务",
-      "分红",
-      "现金流",
-      "估值",
-      "风险",
-      "盈利",
-      "成长",
-      "负债",
-      "行业",
-      "情况",
-      "相关话题",
-      "相关",
-      "怎么样",
-      "怎么看",
-      "能买吗",
-      "还能买吗",
-      "能不能买",
-      "值得买吗",
-      "值得投资吗",
-    ]) {
-      if (subject.includes(term)) {
-        subject = subject.split(term)[0].trim();
-      }
-    }
-
-    for (const word of ["的", "这个", "这只", "这支", "一下", "看看", "帮我", "分析"]) {
-      subject = subject.replaceAll(word, "").trim();
-    }
-
-    if (subject.length >= 2 && !isGenericMarketSubject(subject)) return subject;
-  }
-
-  return "";
-}
-
-function isGenericMarketSubject(subject) {
-  if (!subject) return false;
-  let normalized = subject.trim().toLowerCase().replace(/^[，。,.！？!?：:；;\s]+|[，。,.！？!?：:；;\s]+$/g, "");
-  for (const word of ["的", "这个", "这只", "这支", "一下", "看看", "帮我", "分析"]) {
-    normalized = normalized.replaceAll(word, "").trim();
-  }
-  return genericMarketSubjects.has(normalized);
-}
-
-function shouldClearKlineForPrompt(prompt) {
-  if (/\b(?:sh|sz)\.\d{6}\b/i.test(prompt)) return true;
-  if (/[（(]\d{6}[)）]/.test(prompt) || /\b\d{6}\b/.test(prompt)) return true;
-  return Boolean(extractStockSubjectFromPrompt(prompt));
-}
-
-function captureKlineImage() {
-  if (!klineChart || !klineOption.value) return "";
-
-  try {
-    return klineChart.getDataURL({
-      type: "png",
-      pixelRatio: 2,
-      backgroundColor: "#ffffff",
+  const lastBlock = currentBlocks.value[currentBlocks.value.length - 1];
+  if (lastBlock?.type === "text") {
+    lastBlock.content += content;
+  } else {
+    currentBlocks.value.push({
+      id: crypto.randomUUID(),
+      type: "text",
+      content,
     });
-  } catch (error) {
-    return "";
   }
+  scrollToLatest();
 }
 
-function resetAgentPanels({ clearKlineBeforeRun = false } = {}) {
+function appendKlineBlock(data) {
+  if (!data?.option) return;
+
+  const toolCallKey = data.tool_call_id || `${data.code || "unknown"}:${data.latest?.date || data.count || ""}`;
+  if (toolCallKey && renderedToolCallIds.has(toolCallKey)) return;
+  if (toolCallKey) renderedToolCallIds.add(toolCallKey);
+
+  currentBlocks.value.push({
+    id: crypto.randomUUID(),
+    type: "kline",
+    toolCallId: data.tool_call_id || "",
+    option: data.option,
+    meta: {
+      code: data.code,
+      count: data.count,
+      latest: data.latest,
+    },
+  });
+  scrollToLatest();
+}
+
+function appendKlineErrorBlock(message, data = {}) {
+  const toolCallKey = data.tool_call_id ? `error:${data.tool_call_id}` : "";
+  if (toolCallKey && renderedToolCallIds.has(toolCallKey)) return;
+  if (toolCallKey) renderedToolCallIds.add(toolCallKey);
+
+  currentBlocks.value.push({
+    id: crypto.randomUUID(),
+    type: "kline_error",
+    toolCallId: data.tool_call_id || "",
+    message: message || "K 线数据加载失败。",
+  });
+  scrollToLatest();
+}
+
+function resetAgentPanels() {
   for (const definition of agentDefinitions) {
-    agents[definition.id].content = "";
     agents[definition.id].progress = [];
     agents[definition.id].status = "waiting";
     agents[definition.id].updatedAt = "";
-  }
-  if (clearKlineBeforeRun) {
-    clearKline();
   }
   copiedAgentId.value = "";
 }
 
 function archiveCurrentTurn() {
   const prompt = currentPrompt.value.trim();
-  const content = agents.fundamental?.content?.trim() || "";
-  if (!prompt && !content) return;
+  const blocks = cloneBlocks(currentBlocks.value);
+  if (!prompt && !blocks.length) return;
 
   archivedTurns.value.push({
     id: `turn-${Date.now()}-${archivedTurnCounter}`,
     prompt,
-    content,
-    klineImage: captureKlineImage(),
-    klineMeta: klineMeta.value ? { ...klineMeta.value } : null,
-    klineError: klineError.value,
+    blocks,
     time: new Date().toLocaleTimeString(),
   });
   archivedTurnCounter += 1;
@@ -333,10 +267,9 @@ function setAgentStatus(agentId, status) {
 
 function appendAgentContent(agentId, content) {
   if (!agents[agentId] || !content) return;
-  agents[agentId].content += content;
   agents[agentId].status = "streaming";
   agents[agentId].updatedAt = new Date().toLocaleTimeString();
-  scrollToLatest();
+  appendTextBlock(content);
 }
 
 function appendAgentProgress(agentId, message) {
@@ -359,27 +292,10 @@ function finishPendingAgents() {
   for (const definition of agentDefinitions) {
     const panel = agents[definition.id];
     if (panel.status === "waiting" || panel.status === "streaming") {
-      panel.status = panel.content || panel.progress.length || klineOption.value ? "done" : "idle";
+      panel.status = currentBlocks.value.length || panel.progress.length ? "done" : "idle";
       panel.updatedAt = panel.updatedAt || new Date().toLocaleTimeString();
     }
   }
-}
-
-function renderKlineChart() {
-  nextTick(() => {
-    const chartEl = asElement(klineChartEl.value);
-    if (!chartEl || !klineOption.value) return;
-    if (!klineChart) {
-      klineChart = echarts.init(chartEl);
-    }
-    klineChart.setOption(klineOption.value, true);
-    klineChart.resize();
-    scrollToLatest();
-  });
-}
-
-function resizeKlineChart() {
-  klineChart?.resize();
 }
 
 function cancelRun() {
@@ -422,7 +338,8 @@ async function copyTextContent(content, copyKey) {
 }
 
 async function copyAgentReply(agentId) {
-  const content = agents[agentId]?.content?.trim();
+  if (!agents[agentId]) return;
+  const content = blocksTextContent(currentBlocks.value);
   if (!content) return;
 
   await copyTextContent(content, agentId);
@@ -434,7 +351,9 @@ async function runAnalysis() {
 
   archiveCurrentTurn();
   abortRunRequest();
-  resetAgentPanels({ clearKlineBeforeRun: shouldClearKlineForPrompt(prompt) });
+  resetAgentPanels();
+  currentBlocks.value = [];
+  renderedToolCallIds = new Set();
   errorMessage.value = "";
   runPhase.value = "starting";
   isRunning.value = true;
@@ -494,31 +413,16 @@ async function runAnalysis() {
         }
 
         if (event.event === "kline") {
-          klineOption.value = data.option || null;
-          klineMeta.value = {
-            code: data.code,
-            count: data.count,
-            latest: data.latest,
-          };
-          klineError.value = "";
-          renderKlineChart();
+          appendKlineBlock(data);
           return;
         }
 
         if (event.event === "kline_state") {
-          if (data.action === "clear") {
-            clearKline();
-          } else {
-            renderKlineChart();
-          }
-          scrollToLatest();
           return;
         }
 
         if (event.event === "kline_error") {
-          clearKline();
-          klineError.value = data.message || "K 线数据加载失败。";
-          scrollToLatest();
+          appendKlineErrorBlock(data.message, data);
           return;
         }
 
@@ -589,7 +493,6 @@ async function runAnalysis() {
 }
 
 onMounted(async () => {
-  window.addEventListener("resize", resizeKlineChart);
   try {
     await loadHealth();
   } catch (error) {
@@ -599,8 +502,6 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   abortRunRequest();
-  disposeKlineChart();
-  window.removeEventListener("resize", resizeKlineChart);
 });
 </script>
 
@@ -667,7 +568,7 @@ onBeforeUnmount(() => {
               </div>
             </section>
 
-            <article v-if="turn.content" class="agent-card agent-card-archived agent-fundamental">
+            <article v-if="turn.blocks?.length" class="agent-card agent-card-archived agent-fundamental">
               <div class="agent-card-head">
                 <div class="flex min-w-0 items-center gap-2">
                   <span class="badge badge-sm badge-success"></span>
@@ -677,44 +578,34 @@ onBeforeUnmount(() => {
 
               <div class="agent-response-card">
                 <div class="agent-output">
-                  <div class="agent-final-frame">
-                    <div
-                      class="agent-final markdown-body"
-                      v-html="renderMarkdown(turn.content)"
-                    ></div>
-                    <button
-                      class="btn btn-ghost btn-square btn-sm agent-copy-button"
-                      type="button"
-                      title="复制回复"
-                      aria-label="复制回复"
-                      @click="copyTextContent(turn.content, 'archive-' + turn.id)"
-                    >
-                      <Check v-if="copiedAgentId === 'archive-' + turn.id" :size="16" />
-                      <Copy v-else :size="16" />
-                    </button>
-                  </div>
-
-                  <section
-                    v-if="turn.klineImage || turn.klineError"
-                    class="kline-section kline-section-archived"
-                  >
-                    <div class="kline-head">
-                      <div class="flex items-center gap-2">
-                        <CandlestickChart :size="18" class="text-primary" />
-                        <h3>近一个月 K 线</h3>
-                      </div>
-                      <span v-if="turn.klineMeta" class="kline-meta">
-                        {{ turn.klineMeta.code }} · {{ turn.klineMeta.count }} 条
-                      </span>
+                  <template v-for="block in turn.blocks" :key="block.id">
+                    <div v-if="block.type === 'text'" class="agent-final-frame">
+                      <div
+                        class="agent-final markdown-body"
+                        v-html="renderMarkdown(block.content)"
+                      ></div>
+                      <button
+                        class="btn btn-ghost btn-square btn-sm agent-copy-button"
+                        type="button"
+                        title="复制回复"
+                        aria-label="复制回复"
+                        @click="copyTextContent(blocksTextContent(turn.blocks), 'archive-' + turn.id)"
+                      >
+                        <Check v-if="copiedAgentId === 'archive-' + turn.id" :size="16" />
+                        <Copy v-else :size="16" />
+                      </button>
                     </div>
-                    <img
-                      v-if="turn.klineImage"
-                      class="kline-image"
-                      :src="turn.klineImage"
-                      alt="Archived K-line chart"
+
+                    <KlineChart
+                      v-else-if="block.type === 'kline'"
+                      :option="block.option"
+                      :meta="block.meta"
                     />
-                    <div v-else class="kline-error">{{ turn.klineError }}</div>
-                  </section>
+
+                    <div v-else-if="block.type === 'kline_error'" class="kline-error">
+                      {{ block.message }}
+                    </div>
+                  </template>
 
                   <div class="agent-response-time">{{ turn.time }}</div>
                 </div>
@@ -756,9 +647,7 @@ onBeforeUnmount(() => {
               :class="{
                 'agent-response-card-empty':
                   !agents[definition.id].progress.length &&
-                  !agents[definition.id].content &&
-                  !klineOption &&
-                  !klineError,
+                  !currentBlocks.length,
               }"
             >
               <div class="agent-output">
@@ -780,43 +669,39 @@ onBeforeUnmount(() => {
                   </div>
                 </div>
 
-                <div v-if="agents[definition.id].content" class="agent-final-frame">
-                  <div
-                    class="agent-final markdown-body"
-                    v-html="renderMarkdown(agents[definition.id].content)"
-                  ></div>
-                  <button
-                    class="btn btn-ghost btn-square btn-sm agent-copy-button"
-                    type="button"
-                    title="复制回复"
-                    aria-label="复制回复"
-                    @click="copyAgentReply(definition.id)"
-                  >
-                    <Check v-if="copiedAgentId === definition.id" :size="16" />
-                    <Copy v-else :size="16" />
-                  </button>
-                </div>
-
-                <section v-if="klineOption || klineError" class="kline-section">
-                  <div class="kline-head">
-                    <div class="flex items-center gap-2">
-                      <CandlestickChart :size="18" class="text-primary" />
-                      <h3>近一个月 K 线</h3>
-                    </div>
-                    <span v-if="klineMeta" class="kline-meta">
-                      {{ klineMeta.code }} · {{ klineMeta.count }} 条
-                    </span>
+                <template v-for="block in currentBlocks" :key="block.id">
+                  <div v-if="block.type === 'text'" class="agent-final-frame">
+                    <div
+                      class="agent-final markdown-body"
+                      v-html="renderMarkdown(block.content)"
+                    ></div>
+                    <button
+                      class="btn btn-ghost btn-square btn-sm agent-copy-button"
+                      type="button"
+                      title="复制回复"
+                      aria-label="复制回复"
+                      @click="copyAgentReply(definition.id)"
+                    >
+                      <Check v-if="copiedAgentId === definition.id" :size="16" />
+                      <Copy v-else :size="16" />
+                    </button>
                   </div>
-                  <div v-if="klineOption" ref="klineChartEl" class="kline-chart"></div>
-                  <div v-else class="kline-error">{{ klineError }}</div>
-                </section>
+
+                  <KlineChart
+                    v-else-if="block.type === 'kline'"
+                    :option="block.option"
+                    :meta="block.meta"
+                  />
+
+                  <div v-else-if="block.type === 'kline_error'" class="kline-error">
+                    {{ block.message }}
+                  </div>
+                </template>
 
                 <div
                   v-if="
                     !agents[definition.id].progress.length &&
-                    !agents[definition.id].content &&
-                    !klineOption &&
-                    !klineError
+                    !currentBlocks.length
                   "
                   class="agent-empty"
                 >
