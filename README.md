@@ -69,6 +69,18 @@ LangGraph 默认递归限制为 25 步。通过打印工具调用流程日志，
 * 新增独立 `KlineChart.vue` 组件管理 ECharts 生命周期，并通过 `tool_call_id` 去重，防止同一次工具调用重复渲染图表。
 * 补充走势类历史追问识别，支持“它最近走势怎么样”这类多轮问题复用上一轮股票标的并触发 K 线工具。
 
+### 2026/7/24
+
+将 `vue` 调试控制台从单基本面 Agent 扩展为多 Agent 流式工作台，并增加用户显式选择本轮参与 Agent 的路由机制。
+
+* 技术面、新闻和估值 Agent 新增真实 `astream` 流式输出入口，复用统一的 token、工具进度和异常事件协议。
+* FastAPI 新增多 Agent SSE 聚合接口 `/api/run/agents/stream`，可并发转发基本面、技术面、新闻和估值 Agent 的结构化事件。
+* 前端新增四个 Agent 状态/导航卡片，按 `data.agent` 将 Markdown、工具进度、K 线和错误 block 分流保存到对应 Agent。
+* 新增“发送给”接收者选择栏，支持本轮显式选择 1 到 4 个 Agent；首次默认全选，首次成功后自动收缩为当前查看的 Agent。
+* 后端请求体支持 `target_agents`，只为本轮实际选择的 Agent 创建任务；保留旧 `agent_mode` 字段兼容历史调试入口。
+* 前端区分 `activeAgentId` 与 `selectedAgentIds`：前者控制当前查看内容，后者控制下一轮发送对象，运行中切换卡片不会改变已启动的 Agent 集合。
+* 新增 Agent 回复轮次分隔 block，避免追问内容粘到旧回答末尾；取消、异常和完成状态只影响本轮实际参与的 Agent。
+
 ## 使用 uv 安装项目依赖
 
 克隆项目后，进入项目根目录：

@@ -10,7 +10,7 @@ import time
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,6 +37,22 @@ AGENT_OUTPUT_START = "::agent-output-start "
 AGENT_OUTPUT_END = "::agent-output-end "
 MAX_SESSION_MESSAGES = 12
 MAX_SESSION_CONTENT_CHARS = 5000
+
+AgentId = Literal[
+    "fundamental",
+    "technical",
+    "news",
+    "value",
+]
+
+ALL_AGENT_IDS: tuple[AgentId, ...] = (
+    "fundamental",
+    "technical",
+    "news",
+    "value",
+)
+
+
 def chunk_text(text: str, chunk_size: int = 180):
     for index in range(0, len(text), chunk_size):
         yield text[index : index + chunk_size]
@@ -45,8 +61,30 @@ def chunk_text(text: str, chunk_size: int = 180):
 class RunRequest(BaseModel):
     command: str = Field(min_length=1, max_length=500)
     timeout_seconds: int = Field(default=1800, ge=60, le=7200)
-    agent_mode: str = Field(default="all", pattern="^(all|fundamental)$")
     conversation_id: str = Field(default="default", min_length=1, max_length=100)
+    target_agents: list[AgentId] | None = None
+    agent_mode: str | None = Field(default=None, pattern="^(all|fundamental)$")
+
+
+def resolve_target_agents(request: RunRequest) -> list[AgentId]:
+    if request.target_agents is not None:
+        if not request.target_agents:
+            raise HTTPException(
+                status_code=400,
+                detail="At least one target agent is required.",
+            )
+
+        selected = set(request.target_agents)
+        return [
+            agent_id
+            for agent_id in ALL_AGENT_IDS
+            if agent_id in selected
+        ]
+
+    if request.agent_mode == "fundamental":
+        return ["fundamental"]
+
+    return list(ALL_AGENT_IDS)
 
 
 class KlineRequest(BaseModel):
@@ -705,6 +743,8 @@ async def stream_agents_direct(
     request: RunRequest,
     http_request: Request,
 ) -> StreamingResponse:
+    target_agents = resolve_target_agents(request)
+
     async def event_generator():
         if not AGENT_DIR.exists():
             yield sse_event("error", {"message": f"Agent dir does not exist: {AGENT_DIR}"})
@@ -728,15 +768,20 @@ async def stream_agents_direct(
             yield sse_event("done", {"message": "failed", "ok": False})
             return
 
-        history = session_history_for(request.conversation_id)[-MAX_SESSION_MESSAGES:]
-        base_state = build_fundamental_state(request.command.strip(), history)
-        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-        agent_streams = {
+        all_agent_streams = {
             "fundamental": stream_fundamental_agent,
             "technical": stream_technical_agent,
             "news": stream_news_agent,
             "value": stream_value_agent,
         }
+        agent_streams = {
+            agent_id: all_agent_streams[agent_id]
+            for agent_id in target_agents
+        }
+
+        history = session_history_for(request.conversation_id)[-MAX_SESSION_MESSAGES:]
+        base_state = build_fundamental_state(request.command.strip(), history)
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         analysis_parts: dict[str, list[str]] = {agent_id: [] for agent_id in agent_streams}
         final_outputs: dict[str, str] = {}
         errors: dict[str, str] = {}
@@ -803,6 +848,7 @@ async def stream_agents_direct(
                     "message": "starting",
                     "command": request.command,
                     "agent": "all",
+                    "agents": target_agents,
                 },
             )
 
@@ -907,6 +953,7 @@ async def stream_agents_direct(
                 {
                     "message": "completed" if not errors else "completed_with_errors",
                     "ok": not errors,
+                    "target_agents": target_agents,
                     "errors": errors,
                     "report_path": str(report_path) if report_path else "",
                 },
@@ -927,8 +974,17 @@ async def stream_agents_direct(
                 await asyncio.gather(*tasks, return_exceptions=True)
             if logger_initialized:
                 finalize_execution_logger(success=False, error=str(exc))
-            yield sse_event("error", {"message": str(exc) or "Multi-agent run failed."})
-            yield sse_event("done", {"message": "failed", "ok": False})
+            message = str(exc) or "Multi-agent run failed."
+            yield sse_event("error", {"message": message})
+            yield sse_event(
+                "done",
+                {
+                    "message": "failed",
+                    "ok": False,
+                    "target_agents": target_agents,
+                    "errors": {"all": message},
+                },
+            )
 
     return StreamingResponse(
         event_generator(),

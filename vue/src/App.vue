@@ -50,6 +50,7 @@ const agentDefinitions = [
     accent: "agent-value",
   },
 ];
+const allAgentIds = agentDefinitions.map((agent) => agent.id);
 
 const agents = reactive(
   Object.fromEntries(
@@ -83,13 +84,18 @@ const conversations = ref([
 const archivedTurns = ref([]);
 const currentPrompt = ref("");
 const activeAgentId = ref("fundamental");
+const selectedAgentIds = ref([...allAgentIds]);
+const activeRunAgentIds = ref([]);
+const hasCompletedInitialAnalysis = ref(false);
 const copiedAgentId = ref("");
 
 let runAbortController = null;
 let archivedTurnCounter = 0;
 let renderedToolCallIds = new Set();
 
-const canSend = computed(() => userInput.value.trim().length > 0 && !isRunning.value);
+const canSend = computed(
+  () => userInput.value.trim().length > 0 && selectedAgentIds.value.length > 0 && !isRunning.value
+);
 
 const activeConversation = computed(() => {
   return conversations.value.find((item) => item.id === activeConversationId.value) || conversations.value[0];
@@ -101,6 +107,24 @@ const activeAgentDefinition = computed(() => {
 
 const activeAgentState = computed(() => {
   return agents[activeAgentId.value] || agents.fundamental;
+});
+
+const selectedAgentDefinitions = computed(() => {
+  return agentDefinitions.filter((agent) => selectedAgentIds.value.includes(agent.id));
+});
+
+const recipientPlaceholder = computed(() => {
+  const count = selectedAgentDefinitions.value.length;
+  if (count === 1) {
+    return `向${selectedAgentDefinitions.value[0].name} Agent 继续提问……`;
+  }
+  if (count === allAgentIds.length) return "向全部 Agent 发起分析……";
+  return `向已选择的 ${count} 个 Agent 提问……`;
+});
+
+const recipientSummary = computed(() => {
+  const names = selectedAgentDefinitions.value.map((agent) => agent.name).join("、");
+  return `本轮发送给：${names}`;
 });
 
 const shouldShowAgentWorkspace = computed(() => {
@@ -234,6 +258,50 @@ function normalizeAgentId(value) {
   return "fundamental";
 }
 
+function normalizeSelectedAgentIds(values, fallbackId = activeAgentId.value) {
+  const selected = new Set(
+    values
+      .map((value) => normalizeAgentId(value))
+      .filter((agentId) => allAgentIds.includes(agentId))
+  );
+  const ordered = allAgentIds.filter((agentId) => selected.has(agentId));
+  if (ordered.length) return ordered;
+  return fallbackId ? [normalizeAgentId(fallbackId)] : [];
+}
+
+function setSelectedAgentIds(values, fallbackId = activeAgentId.value) {
+  selectedAgentIds.value = normalizeSelectedAgentIds(values, fallbackId);
+}
+
+function isAgentSelected(agentId) {
+  return selectedAgentIds.value.includes(normalizeAgentId(agentId));
+}
+
+function toggleAgentSelection(agentId) {
+  if (isRunning.value) return;
+
+  const normalizedAgentId = normalizeAgentId(agentId);
+  if (isAgentSelected(normalizedAgentId)) {
+    if (selectedAgentIds.value.length === 1) return;
+    setSelectedAgentIds(
+      selectedAgentIds.value.filter((id) => id !== normalizedAgentId),
+      normalizedAgentId
+    );
+    return;
+  }
+
+  setSelectedAgentIds([...selectedAgentIds.value, normalizedAgentId], normalizedAgentId);
+}
+
+function handleAgentCardClick(agentId) {
+  const normalizedAgentId = normalizeAgentId(agentId);
+  activeAgentId.value = normalizedAgentId;
+
+  if (!isRunning.value && hasCompletedInitialAnalysis.value) {
+    setSelectedAgentIds([normalizedAgentId], normalizedAgentId);
+  }
+}
+
 function latestProgressMessage(agentId) {
   const progress = agents[agentId]?.progress || [];
   return progress[progress.length - 1]?.message || "";
@@ -277,6 +345,20 @@ function appendTextBlock(agentId, content) {
   scrollToLatest();
 }
 
+function appendTurnBoundaryBlock(agentId) {
+  const agent = agents[agentId];
+  if (!agent || !agent.blocks.length) return;
+
+  const lastBlock = agent.blocks[agent.blocks.length - 1];
+  if (lastBlock?.type === "turn_boundary") return;
+
+  agent.blocks.push({
+    id: crypto.randomUUID(),
+    type: "turn_boundary",
+    time: new Date().toLocaleTimeString(),
+  });
+}
+
 function appendKlineBlock(agentId, data) {
   if (!data?.option || !agents[agentId]) return;
 
@@ -315,26 +397,27 @@ function appendKlineErrorBlock(agentId, message, data = {}) {
   scrollToLatest();
 }
 
-function resetAgentPanels() {
-  for (const definition of agentDefinitions) {
-    agents[definition.id].progress = [];
-    agents[definition.id].blocks = [];
-    agents[definition.id].status = "waiting";
-    agents[definition.id].updatedAt = "";
+function prepareSelectedAgentPanels(agentIds) {
+  for (const agentId of normalizeSelectedAgentIds(agentIds, null)) {
+    const agent = agents[agentId];
+    if (!agent) continue;
+
+    appendTurnBoundaryBlock(agentId);
+    agent.progress = [];
+    agent.status = "waiting";
+    agent.updatedAt = "";
   }
   copiedAgentId.value = "";
 }
 
 function archiveCurrentTurn() {
   const prompt = currentPrompt.value.trim();
-  // Multi-agent history will expand later; for now keep the existing fundamental-only archive.
-  const blocks = cloneBlocks(agents.fundamental.blocks);
-  if (!prompt && !blocks.length) return;
+  if (!prompt) return;
 
   archivedTurns.value.push({
     id: `turn-${Date.now()}-${archivedTurnCounter}`,
     prompt,
-    blocks,
+    blocks: [],
     time: new Date().toLocaleTimeString(),
   });
   archivedTurnCounter += 1;
@@ -381,11 +464,31 @@ function isLatestProgress(agentId, progressId) {
   return progress.length > 0 && progress[progress.length - 1].id === progressId;
 }
 
-function finishPendingAgents() {
-  for (const definition of agentDefinitions) {
-    const panel = agents[definition.id];
-    if (panel.status === "streaming") {
-      panel.status = panel.blocks.length || panel.progress.length ? "done" : "idle";
+function finishPendingAgents(agentIds) {
+  for (const agentId of normalizeSelectedAgentIds(agentIds, null)) {
+    const panel = agents[agentId];
+    if (panel.status === "waiting" || panel.status === "streaming") {
+      panel.status = "done";
+      panel.updatedAt = panel.updatedAt || new Date().toLocaleTimeString();
+    }
+  }
+}
+
+function markRunAgentsError(agentIds) {
+  for (const agentId of normalizeSelectedAgentIds(agentIds, null)) {
+    const panel = agents[agentId];
+    if (panel.status !== "done") {
+      panel.status = "error";
+      panel.updatedAt = panel.updatedAt || new Date().toLocaleTimeString();
+    }
+  }
+}
+
+function markRunAgentsCancelled(agentIds) {
+  for (const agentId of normalizeSelectedAgentIds(agentIds, null)) {
+    const panel = agents[agentId];
+    if (panel.status === "waiting" || panel.status === "streaming") {
+      panel.status = "idle";
       panel.updatedAt = panel.updatedAt || new Date().toLocaleTimeString();
     }
   }
@@ -398,7 +501,8 @@ function cancelRun() {
   isRunning.value = false;
   runPhase.value = "cancelled";
   updateActiveConversationStatus("cancelled");
-  finishPendingAgents();
+  markRunAgentsCancelled(activeRunAgentIds.value);
+  activeRunAgentIds.value = [];
 }
 
 async function copyTextContent(content, copyKey) {
@@ -442,10 +546,13 @@ async function runAnalysis() {
   const prompt = userInput.value.trim();
   if (!prompt || isRunning.value) return;
 
+  const targetAgentIds = normalizeSelectedAgentIds(selectedAgentIds.value);
+  if (!targetAgentIds.length) return;
+
   archiveCurrentTurn();
   abortRunRequest();
-  resetAgentPanels();
-  activeAgentId.value = "fundamental";
+  activeRunAgentIds.value = [...targetAgentIds];
+  prepareSelectedAgentPanels(targetAgentIds);
   renderedToolCallIds = new Set();
   errorMessage.value = "";
   runPhase.value = "starting";
@@ -469,8 +576,8 @@ async function runAnalysis() {
       body: JSON.stringify({
         command: prompt,
         timeout_seconds: 1800,
-        agent_mode: "all",
         conversation_id: conversationId,
+        target_agents: targetAgentIds,
       }),
       signal: controller.signal,
       openWhenHidden: true,
@@ -528,8 +635,8 @@ async function runAnalysis() {
         }
 
         if (event.event === "agent_error") {
-          setAgentStatus(agentId, "error");
           appendAgentProgress(agentId, data.message || "Agent 执行失败。");
+          setAgentStatus(agentId, "error");
           return;
         }
 
@@ -538,20 +645,24 @@ async function runAnalysis() {
           isRunning.value = false;
           runPhase.value = "failed";
           updateActiveConversationStatus("failed");
-          const failedAgentId = normalizeAgentId(data.agent || "fundamental");
-          if (agents[failedAgentId].status !== "done") {
-            agents[failedAgentId].status = "error";
-          }
+          markRunAgentsError(activeRunAgentIds.value);
+          activeRunAgentIds.value = [];
           streamCompleted = true;
           throw new Error(errorMessage.value);
         }
 
         if (event.event === "done") {
+          const completedRunAgentIds = [...activeRunAgentIds.value];
           streamCompleted = true;
           isRunning.value = false;
           runPhase.value = data.ok ? "done" : "failed";
-          finishPendingAgents();
+          finishPendingAgents(completedRunAgentIds);
           updateActiveConversationStatus(data.ok ? "done" : "failed");
+          if (data.ok && !hasCompletedInitialAnalysis.value) {
+            hasCompletedInitialAnalysis.value = true;
+            setSelectedAgentIds([activeAgentId.value]);
+          }
+          activeRunAgentIds.value = [];
           runAbortController = null;
         }
       },
@@ -560,7 +671,8 @@ async function runAnalysis() {
           isRunning.value = false;
           runPhase.value = "closed";
           updateActiveConversationStatus("closed");
-          finishPendingAgents();
+          markRunAgentsCancelled(activeRunAgentIds.value);
+          activeRunAgentIds.value = [];
         }
         if (runAbortController === controller) {
           runAbortController = null;
@@ -575,9 +687,8 @@ async function runAnalysis() {
         isRunning.value = false;
         runPhase.value = "failed";
         updateActiveConversationStatus("failed");
-        if (agents.fundamental.status !== "done") {
-          agents.fundamental.status = "error";
-        }
+        markRunAgentsError(activeRunAgentIds.value);
+        activeRunAgentIds.value = [];
         if (runAbortController === controller) {
           runAbortController = null;
         }
@@ -592,7 +703,8 @@ async function runAnalysis() {
     isRunning.value = false;
     runPhase.value = "failed";
     updateActiveConversationStatus("failed");
-    finishPendingAgents();
+    markRunAgentsError(activeRunAgentIds.value);
+    activeRunAgentIds.value = [];
   }
 }
 
@@ -709,6 +821,10 @@ onBeforeUnmount(() => {
                     <div v-else-if="block.type === 'kline_error'" class="kline-error">
                       {{ block.message }}
                     </div>
+
+                    <div v-else-if="block.type === 'turn_boundary'" class="agent-turn-boundary">
+                      <span>新一轮回答</span>
+                    </div>
                   </template>
 
                   <div class="agent-response-time">{{ turn.time }}</div>
@@ -737,7 +853,7 @@ onBeforeUnmount(() => {
               type="button"
               role="tab"
               :aria-selected="activeAgentId === definition.id"
-              @click="activeAgentId = definition.id"
+              @click="handleAgentCardClick(definition.id)"
           >
               <div class="agent-switch-head">
                 <span class="badge badge-sm" :class="definition.tone"></span>
@@ -830,6 +946,10 @@ onBeforeUnmount(() => {
                   <div v-else-if="block.type === 'kline_error'" class="kline-error">
                     {{ block.message }}
                   </div>
+
+                  <div v-else-if="block.type === 'turn_boundary'" class="agent-turn-boundary">
+                    <span>新一轮回答 · {{ block.time }}</span>
+                  </div>
                 </template>
 
                 <div
@@ -852,11 +972,35 @@ onBeforeUnmount(() => {
       </div>
 
       <footer class="composer">
+        <section class="agent-recipient-bar" :class="{ disabled: isRunning }">
+          <div class="agent-recipient-label">发送给：</div>
+          <div class="agent-recipient-options" aria-label="选择本轮接收 Agent">
+            <label
+              v-for="definition in agentDefinitions"
+              :key="definition.id"
+              class="agent-recipient-option"
+              :class="{ selected: isAgentSelected(definition.id), disabled: isRunning }"
+            >
+              <input
+                class="checkbox checkbox-xs"
+                type="checkbox"
+                :checked="isAgentSelected(definition.id)"
+                :disabled="isRunning || (isAgentSelected(definition.id) && selectedAgentIds.length === 1)"
+                @change="toggleAgentSelection(definition.id)"
+              />
+              <span>{{ definition.name }}</span>
+            </label>
+          </div>
+          <div class="agent-recipient-summary">
+            {{ recipientSummary }}
+          </div>
+        </section>
         <div class="join composer-box bg-base-100 shadow-lg">
           <textarea
             v-model="userInput"
             class="textarea join-item composer-input"
             :disabled="isRunning"
+            :placeholder="recipientPlaceholder"
             spellcheck="false"
             @keydown.enter.exact.prevent="runAnalysis"
           ></textarea>
