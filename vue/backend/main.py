@@ -445,13 +445,49 @@ def build_kline_payload_from_tool(data: dict[str, Any]) -> dict[str, Any]:
         latest = rows[-1]
 
     return {
-        "agent": "fundamental",
+        "agent": data.get("agent", "fundamental"),
         "code": code,
         "count": len(rows),
         "latest": latest,
         "option": build_kline_option(rows, code),
         "tool_call_id": data.get("tool_call_id", ""),
     }
+
+
+def clone_agent_state(state: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "messages": list(state.get("messages", [])),
+        "data": dict(state.get("data", {})),
+        "metadata": dict(state.get("metadata", {})),
+    }
+
+
+def write_multi_agent_report(command: str, outputs: dict[str, str]) -> Path | None:
+    sections = [
+        ("fundamental", "基本面 Agent"),
+        ("technical", "技术分析 Agent"),
+        ("news", "新闻分析 Agent"),
+        ("value", "估值分析 Agent"),
+    ]
+    content_parts = []
+    for agent_id, title in sections:
+        content = outputs.get(agent_id, "").strip()
+        if content:
+            content_parts.append(f"## {title}\n\n{content}")
+
+    if not content_parts:
+        return None
+
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = REPORTS_DIR / f"multi_agent_report_{timestamp}.md"
+    path.write_text(
+        f"# 多 Agent 股票分析报告\n\n"
+        f"**用户问题**：{command}\n\n"
+        f"{chr(10).join(content_parts)}\n",
+        encoding="utf-8",
+    )
+    return path
 
 
 @app.get("/api/health")
@@ -651,6 +687,247 @@ async def stream_fundamental_direct(
                 },
             )
             yield sse_event("error", {"message": str(exc) or "Agent run failed."})
+            yield sse_event("done", {"message": "failed", "ok": False})
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.post("/api/run/agents/stream")
+async def stream_agents_direct(
+    request: RunRequest,
+    http_request: Request,
+) -> StreamingResponse:
+    async def event_generator():
+        if not AGENT_DIR.exists():
+            yield sse_event("error", {"message": f"Agent dir does not exist: {AGENT_DIR}"})
+            yield sse_event("done", {"message": "failed", "ok": False})
+            return
+
+        ensure_agent_import_path()
+
+        try:
+            from src.agents.fundamental_agent import stream_fundamental_agent
+            from src.agents.news_agent import stream_news_agent
+            from src.agents.technical_agent import stream_technical_agent
+            from src.agents.value_agent import stream_value_agent
+            from src.single_agent_runner import build_fundamental_state
+            from src.utils.execution_logger import (
+                finalize_execution_logger,
+                initialize_execution_logger,
+            )
+        except Exception as exc:
+            yield sse_event("error", {"message": f"Unable to import Agent modules: {exc}"})
+            yield sse_event("done", {"message": "failed", "ok": False})
+            return
+
+        history = session_history_for(request.conversation_id)[-MAX_SESSION_MESSAGES:]
+        base_state = build_fundamental_state(request.command.strip(), history)
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        agent_streams = {
+            "fundamental": stream_fundamental_agent,
+            "technical": stream_technical_agent,
+            "news": stream_news_agent,
+            "value": stream_value_agent,
+        }
+        analysis_parts: dict[str, list[str]] = {agent_id: [] for agent_id in agent_streams}
+        final_outputs: dict[str, str] = {}
+        errors: dict[str, str] = {}
+        logger_initialized = False
+
+        async def forward_agent(agent_id: str, stream_func):
+            try:
+                async for item in stream_func(clone_agent_state(base_state)):
+                    data = item.get("data", {})
+                    if isinstance(data, dict):
+                        data.setdefault("agent", agent_id)
+                    await queue.put(
+                        {
+                            "agent": agent_id,
+                            "event": item.get("event", "status"),
+                            "data": data,
+                        }
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                errors[agent_id] = str(exc) or f"{agent_id} Agent run failed."
+                await queue.put(
+                    {
+                        "agent": agent_id,
+                        "event": "agent_status",
+                        "data": {
+                            "agent": agent_id,
+                            "status": "error",
+                            "time": datetime.now().isoformat(),
+                        },
+                    }
+                )
+                await queue.put(
+                    {
+                        "agent": agent_id,
+                        "event": "agent_error",
+                        "data": {
+                            "agent": agent_id,
+                            "message": errors[agent_id],
+                            "time": datetime.now().isoformat(),
+                        },
+                    }
+                )
+            finally:
+                await queue.put(
+                    {
+                        "agent": agent_id,
+                        "event": "_agent_done",
+                        "data": {"agent": agent_id},
+                    }
+                )
+
+        tasks: list[asyncio.Task] = []
+
+        try:
+            RUNS_DIR.mkdir(parents=True, exist_ok=True)
+            initialize_execution_logger(str(AGENT_DIR / "logs"))
+            logger_initialized = True
+
+            yield sse_event(
+                "status",
+                {
+                    "message": "starting",
+                    "command": request.command,
+                    "agent": "all",
+                },
+            )
+
+            for agent_id in agent_streams:
+                yield sse_event(
+                    "agent_status",
+                    {
+                        "agent": agent_id,
+                        "status": "waiting",
+                        "time": datetime.now().isoformat(),
+                    },
+                )
+
+            tasks = [
+                asyncio.create_task(forward_agent(agent_id, stream_func))
+                for agent_id, stream_func in agent_streams.items()
+            ]
+
+            completed_agents = 0
+            while completed_agents < len(tasks):
+                if await http_request.is_disconnected():
+                    raise asyncio.CancelledError
+
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=0.2)
+                except asyncio.TimeoutError:
+                    continue
+
+                event_name = item.get("event", "status")
+                data = item.get("data", {})
+                agent_id = item.get("agent") or data.get("agent") or "fundamental"
+
+                if event_name == "_agent_done":
+                    completed_agents += 1
+                    continue
+
+                if event_name == "token":
+                    content = str(data.get("content", ""))
+                    if content:
+                        analysis_parts.setdefault(agent_id, []).append(content)
+                        yield sse_event(
+                            "token",
+                            {
+                                "agent": agent_id,
+                                "content": content,
+                                "time": datetime.now().isoformat(),
+                            },
+                        )
+                    continue
+
+                if event_name == "final":
+                    final_outputs[agent_id] = str(data.get("content", "")).strip()
+                    continue
+
+                if event_name == "kline_data":
+                    try:
+                        yield sse_event("kline", build_kline_payload_from_tool(data))
+                    except Exception as exc:
+                        yield sse_event(
+                            "kline_error",
+                            {
+                                "agent": agent_id,
+                                "tool_call_id": data.get("tool_call_id", ""),
+                                "message": str(exc) or "K-line data could not be rendered.",
+                            },
+                        )
+                    continue
+
+                yield sse_event(event_name, data)
+
+            for agent_id, parts in analysis_parts.items():
+                final_outputs.setdefault(agent_id, "".join(parts).strip())
+
+            report_path = write_multi_agent_report(request.command, final_outputs)
+            combined_response = "\n\n".join(
+                f"{agent_id}: {content}"
+                for agent_id, content in final_outputs.items()
+                if content.strip()
+            )
+            if combined_response:
+                append_session_memory(
+                    request.conversation_id,
+                    request.command,
+                    combined_response,
+                )
+
+            if report_path:
+                yield sse_event(
+                    "report",
+                    {
+                        "path": str(report_path),
+                        "content": read_text(report_path),
+                    },
+                )
+
+            if logger_initialized:
+                finalize_execution_logger(success=not errors)
+                logger_initialized = False
+
+            yield sse_event(
+                "done",
+                {
+                    "message": "completed" if not errors else "completed_with_errors",
+                    "ok": not errors,
+                    "errors": errors,
+                    "report_path": str(report_path) if report_path else "",
+                },
+            )
+
+        except asyncio.CancelledError:
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            if logger_initialized:
+                finalize_execution_logger(success=False, error="Client disconnected.")
+            raise
+        except Exception as exc:
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            if logger_initialized:
+                finalize_execution_logger(success=False, error=str(exc))
+            yield sse_event("error", {"message": str(exc) or "Multi-agent run failed."})
             yield sse_event("done", {"message": "failed", "ok": False})
 
     return StreamingResponse(

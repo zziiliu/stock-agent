@@ -4,7 +4,7 @@ ValueAnalysis Agent: Performs valuation analysis of a stock using ReAct Agent fr
 """
 import os
 import json
-from typing import Dict, Any, List, Optional
+from typing import AsyncIterator, Dict, Any, List, Optional
 from langchain_core.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI  # 恢复OpenAI接口调用
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, BaseMessage
@@ -17,6 +17,7 @@ from src.utils.state_definition import AgentState
 from src.tools.mcp_client import get_mcp_tools
 from src.utils.logging_config import setup_logger, ERROR_ICON, SUCCESS_ICON, WAIT_ICON
 from src.utils.execution_logger import get_execution_logger
+from src.agents.streaming_utils import stream_react_agent_chunks
 from dotenv import load_dotenv
 
 # 从.env文件加载环境变量
@@ -32,6 +33,209 @@ VALUE_TOOL_NAMES = frozenset({
     "get_balance_data",
     "get_dividend_data",
 })
+
+VALUE_PROGRESS_MESSAGES = {
+    "get_stock_basic_info": "正在获取公司基本信息。",
+    "get_stock_industry": "正在获取行业分类信息。",
+    "get_historical_k_data": "正在获取历史价格和估值参考数据。",
+    "get_profit_data": "正在获取盈利能力数据。",
+    "get_growth_data": "正在获取成长能力数据。",
+    "get_balance_data": "正在获取资产负债数据。",
+    "get_dividend_data": "正在获取历史分红数据。",
+}
+
+
+async def stream_value_agent(state: AgentState) -> AsyncIterator[dict[str, Any]]:
+    """Stream real LLM chunks from the valuation ReAct agent."""
+    logger.info(f"{WAIT_ICON} ValueAgent: Starting streaming valuation analysis.")
+    load_dotenv(override=True)
+
+    execution_logger = get_execution_logger()
+    agent_name = "value_agent"
+    agent_id = "value"
+
+    current_data = state.get("data", {})
+    current_metadata = state.get("metadata", {})
+    user_query = current_data.get("query")
+
+    execution_logger.log_agent_start(agent_name, {
+        "user_query": user_query,
+        "stock_code": current_data.get("stock_code"),
+        "company_name": current_data.get("company_name"),
+        "input_data_keys": list(current_data.keys()),
+        "streaming": True,
+    })
+
+    if not user_query:
+        current_data["value_analysis_error"] = "User query is missing."
+        execution_logger.log_agent_complete(agent_name, current_data, 0, False, "User query is missing")
+        raise ValueError("User query is missing.")
+
+    agent_start_time = time.time()
+
+    try:
+        api_key = os.getenv("OPENAI_COMPATIBLE_API_KEY")
+        base_url = os.getenv("OPENAI_COMPATIBLE_BASE_URL")
+        model_name = os.getenv("OPENAI_COMPATIBLE_MODEL")
+
+        if not all([api_key, base_url, model_name]):
+            current_data["value_analysis_error"] = "Missing OpenAI environment variables."
+            execution_logger.log_agent_complete(
+                agent_name,
+                current_data,
+                time.time() - agent_start_time,
+                False,
+                "Missing OpenAI environment variables",
+            )
+            raise RuntimeError("Missing OpenAI environment variables.")
+
+        yield {
+            "event": "agent_progress",
+            "data": {"agent": agent_id, "message": "正在连接估值分析工具..."},
+        }
+
+        llm = ChatOpenAI(
+            model=model_name,
+            api_key=api_key,
+            base_url=base_url,
+            temperature=0.3,
+            max_tokens=6000,
+            streaming=True,
+        )
+
+        async with get_mcp_tools() as all_mcp_tools:
+            mcp_tools = [
+                tool
+                for tool in all_mcp_tools
+                if tool.name in VALUE_TOOL_NAMES
+            ]
+
+            loaded_names = {tool.name for tool in mcp_tools}
+            missing_names = VALUE_TOOL_NAMES - loaded_names
+            if missing_names:
+                raise RuntimeError(f"ValueAgent 缺少 MCP 工具: {sorted(missing_names)}")
+            if not mcp_tools:
+                raise RuntimeError("No MCP tools available.")
+
+            yield {
+                "event": "agent_progress",
+                "data": {"agent": agent_id, "message": "已加载估值分析工具。"},
+            }
+
+            agent = create_react_agent(llm, mcp_tools)
+
+            stock_code = current_data.get("stock_code", "Unknown")
+            company_name = current_data.get("company_name", "Unknown")
+            current_time_info = current_data.get("current_time_info", "未知时间")
+            current_date = current_data.get("current_date", "未知日期")
+
+            agent_input = f"""请分析{company_name}（股票代码：{stock_code}）的估值情况。
+
+当前时间：{current_time_info}
+当前日期：{current_date}
+
+请进行以下估值分析：
+1. 获取公司基础信息和所属行业
+2. 获取近期股价及历史 PE、PB、PS、PCF 等估值指标
+3. 分析当前估值相对于自身历史水平的位置
+4. 结合盈利能力、成长能力和资产负债情况，判断估值是否有基本面支撑
+5. 分析历史分红情况
+6. 给出偏高、合理或偏低的估值判断
+
+如果工具没有返回行业平均估值、同行估值、市值或现金流预测数据，
+不要自行假设，也不要计算 DCF 内在价值，应明确说明数据不足。
+"""
+
+            logger.info(f"Agent input: {agent_input}")
+            input_data = {"messages": [HumanMessage(content=agent_input)]}
+
+            yield {
+                "event": "agent_status",
+                "data": {"agent": agent_id, "status": "streaming"},
+            }
+            yield {
+                "event": "status",
+                "data": {"message": "正在执行估值分析。", "agent": agent_id},
+            }
+
+            start_time = time.time()
+            streamed_parts: list[str] = []
+            async for event in stream_react_agent_chunks(
+                agent,
+                input_data,
+                agent_id=agent_id,
+                streamed_parts=streamed_parts,
+                tool_progress_messages=VALUE_PROGRESS_MESSAGES,
+            ):
+                yield event
+
+        execution_time = time.time() - start_time
+        final_output = "".join(streamed_parts).strip()
+        if not final_output:
+            raise RuntimeError("No streamed valuation analysis generated.")
+
+        print("::agent-output-start value", flush=True)
+        print(final_output, flush=True)
+        print("::agent-output-end value", flush=True)
+
+        execution_logger.log_llm_interaction(
+            agent_name=agent_name,
+            interaction_type="react_agent_stream",
+            input_messages=[{"role": "user", "content": agent_input}],
+            output_content=final_output,
+            model_config={
+                "model": model_name,
+                "temperature": 0.3,
+                "max_tokens": 6000,
+                "api_base": base_url,
+                "streaming": True,
+            },
+            execution_time=execution_time,
+        )
+
+        current_data["value_analysis"] = final_output
+        current_metadata["value_agent_executed"] = True
+        current_metadata["value_agent_timestamp"] = str(time.time())
+        current_metadata["value_agent_execution_time"] = f"{execution_time:.2f} seconds"
+
+        total_execution_time = time.time() - agent_start_time
+        execution_logger.log_agent_complete(
+            agent_name,
+            {
+                "value_analysis_length": len(final_output),
+                "analysis_preview": final_output[:500],
+                "llm_execution_time": execution_time,
+                "total_execution_time": total_execution_time,
+                "streamed": True,
+            },
+            total_execution_time,
+            True,
+        )
+
+        yield {
+            "event": "final",
+            "data": {"agent": agent_id, "content": final_output},
+        }
+        yield {
+            "event": "agent_status",
+            "data": {"agent": agent_id, "status": "done"},
+        }
+
+    except Exception as e:
+        logger.error(
+            f"{ERROR_ICON} ValueAgent: Streaming execution failed: {e}",
+            exc_info=True,
+        )
+        current_data["value_analysis_error"] = str(e)
+        current_metadata["value_agent_error"] = str(e)
+        execution_logger.log_agent_complete(
+            agent_name,
+            current_data,
+            time.time() - agent_start_time,
+            False,
+            str(e),
+        )
+        raise
 
 async def value_agent(state: AgentState) -> AgentState:
     """

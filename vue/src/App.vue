@@ -23,9 +23,31 @@ marked.setOptions({ breaks: true, gfm: true });
 const agentDefinitions = [
   {
     id: "fundamental",
-    name: "基本面 Agent",
+    name: "基本面",
+    fullName: "基本面 Agent",
     tone: "badge-success",
     accent: "agent-fundamental",
+  },
+  {
+    id: "technical",
+    name: "技术面",
+    fullName: "技术分析 Agent",
+    tone: "badge-info",
+    accent: "agent-technical",
+  },
+  {
+    id: "news",
+    name: "新闻",
+    fullName: "新闻分析 Agent",
+    tone: "badge-secondary",
+    accent: "agent-news",
+  },
+  {
+    id: "value",
+    name: "估值",
+    fullName: "估值分析 Agent",
+    tone: "badge-warning",
+    accent: "agent-value",
   },
 ];
 
@@ -35,6 +57,7 @@ const agents = reactive(
       agent.id,
       {
         progress: [],
+        blocks: [],
         status: "idle",
         updatedAt: "",
       },
@@ -59,7 +82,7 @@ const conversations = ref([
 ]);
 const archivedTurns = ref([]);
 const currentPrompt = ref("");
-const currentBlocks = ref([]);
+const activeAgentId = ref("fundamental");
 const copiedAgentId = ref("");
 
 let runAbortController = null;
@@ -70,6 +93,18 @@ const canSend = computed(() => userInput.value.trim().length > 0 && !isRunning.v
 
 const activeConversation = computed(() => {
   return conversations.value.find((item) => item.id === activeConversationId.value) || conversations.value[0];
+});
+
+const activeAgentDefinition = computed(() => {
+  return agentDefinitions.find((agent) => agent.id === activeAgentId.value) || agentDefinitions[0];
+});
+
+const activeAgentState = computed(() => {
+  return agents[activeAgentId.value] || agents.fundamental;
+});
+
+const shouldShowAgentWorkspace = computed(() => {
+  return Boolean(currentPrompt.value || archivedTurns.value.length || isRunning.value || errorMessage.value);
 });
 
 const statusBadgeText = computed(() => {
@@ -175,14 +210,65 @@ function blocksTextContent(blocks) {
     .trim();
 }
 
-function appendTextBlock(content) {
-  if (!content) return;
+function normalizeAgentId(value) {
+  const raw = String(value || "fundamental").trim().toLowerCase();
+  const normalized = raw.replace(/[-\s]/g, "_");
+  const aliases = {
+    fundamental: "fundamental",
+    fundamental_agent: "fundamental",
+    technical: "technical",
+    technical_agent: "technical",
+    news: "news",
+    news_agent: "news",
+    value: "value",
+    value_agent: "value",
+    valuation: "value",
+    valuation_agent: "value",
+  };
+  const agentId = aliases[normalized];
+  if (agentId && agents[agentId]) return agentId;
 
-  const lastBlock = currentBlocks.value[currentBlocks.value.length - 1];
+  if (import.meta.env.DEV) {
+    console.warn(`Unknown agent id '${value}', falling back to fundamental.`);
+  }
+  return "fundamental";
+}
+
+function latestProgressMessage(agentId) {
+  const progress = agents[agentId]?.progress || [];
+  return progress[progress.length - 1]?.message || "";
+}
+
+function agentStatusSummary(agentId) {
+  const agent = agents[agentId];
+  if (!agent) return "尚未开始";
+  const latestProgress = latestProgressMessage(agentId);
+  if (latestProgress) return latestProgress;
+  if (agent.status === "waiting") return "等待该 Agent 开始分析";
+  if (agent.status === "streaming") return "正在生成分析";
+  if (agent.status === "done") return agent.blocks.length ? "分析完成" : "已完成，无正文";
+  if (agent.status === "error") return "执行失败";
+  return "尚未开始";
+}
+
+function activeAgentEmptyText() {
+  const status = activeAgentState.value.status;
+  if (status === "waiting") return "等待该 Agent 开始分析";
+  if (status === "streaming") return "正在生成分析";
+  if (status === "done") return "该 Agent 已完成，但没有返回正文";
+  if (status === "error") return "该 Agent 执行失败";
+  return "尚未开始";
+}
+
+function appendTextBlock(agentId, content) {
+  if (!content || !agents[agentId]) return;
+
+  const blocks = agents[agentId].blocks;
+  const lastBlock = blocks[blocks.length - 1];
   if (lastBlock?.type === "text") {
     lastBlock.content += content;
   } else {
-    currentBlocks.value.push({
+    blocks.push({
       id: crypto.randomUUID(),
       type: "text",
       content,
@@ -191,14 +277,15 @@ function appendTextBlock(content) {
   scrollToLatest();
 }
 
-function appendKlineBlock(data) {
-  if (!data?.option) return;
+function appendKlineBlock(agentId, data) {
+  if (!data?.option || !agents[agentId]) return;
 
   const toolCallKey = data.tool_call_id || `${data.code || "unknown"}:${data.latest?.date || data.count || ""}`;
-  if (toolCallKey && renderedToolCallIds.has(toolCallKey)) return;
-  if (toolCallKey) renderedToolCallIds.add(toolCallKey);
+  const agentToolCallKey = toolCallKey ? `${agentId}:${toolCallKey}` : "";
+  if (agentToolCallKey && renderedToolCallIds.has(agentToolCallKey)) return;
+  if (agentToolCallKey) renderedToolCallIds.add(agentToolCallKey);
 
-  currentBlocks.value.push({
+  agents[agentId].blocks.push({
     id: crypto.randomUUID(),
     type: "kline",
     toolCallId: data.tool_call_id || "",
@@ -212,12 +299,14 @@ function appendKlineBlock(data) {
   scrollToLatest();
 }
 
-function appendKlineErrorBlock(message, data = {}) {
-  const toolCallKey = data.tool_call_id ? `error:${data.tool_call_id}` : "";
+function appendKlineErrorBlock(agentId, message, data = {}) {
+  if (!agents[agentId]) return;
+
+  const toolCallKey = data.tool_call_id ? `${agentId}:error:${data.tool_call_id}` : "";
   if (toolCallKey && renderedToolCallIds.has(toolCallKey)) return;
   if (toolCallKey) renderedToolCallIds.add(toolCallKey);
 
-  currentBlocks.value.push({
+  agents[agentId].blocks.push({
     id: crypto.randomUUID(),
     type: "kline_error",
     toolCallId: data.tool_call_id || "",
@@ -229,6 +318,7 @@ function appendKlineErrorBlock(message, data = {}) {
 function resetAgentPanels() {
   for (const definition of agentDefinitions) {
     agents[definition.id].progress = [];
+    agents[definition.id].blocks = [];
     agents[definition.id].status = "waiting";
     agents[definition.id].updatedAt = "";
   }
@@ -237,7 +327,8 @@ function resetAgentPanels() {
 
 function archiveCurrentTurn() {
   const prompt = currentPrompt.value.trim();
-  const blocks = cloneBlocks(currentBlocks.value);
+  // Multi-agent history will expand later; for now keep the existing fundamental-only archive.
+  const blocks = cloneBlocks(agents.fundamental.blocks);
   if (!prompt && !blocks.length) return;
 
   archivedTurns.value.push({
@@ -259,27 +350,29 @@ function scrollToLatest() {
 }
 
 function setAgentStatus(agentId, status) {
-  if (!agents[agentId]) return;
-  agents[agentId].status = status;
-  agents[agentId].updatedAt = new Date().toLocaleTimeString();
+  const normalizedAgentId = normalizeAgentId(agentId);
+  agents[normalizedAgentId].status = status;
+  agents[normalizedAgentId].updatedAt = new Date().toLocaleTimeString();
   scrollToLatest();
 }
 
 function appendAgentContent(agentId, content) {
-  if (!agents[agentId] || !content) return;
-  agents[agentId].status = "streaming";
-  agents[agentId].updatedAt = new Date().toLocaleTimeString();
-  appendTextBlock(content);
+  const normalizedAgentId = normalizeAgentId(agentId);
+  if (!content) return;
+  agents[normalizedAgentId].status = "streaming";
+  agents[normalizedAgentId].updatedAt = new Date().toLocaleTimeString();
+  appendTextBlock(normalizedAgentId, content);
 }
 
 function appendAgentProgress(agentId, message) {
-  if (!agents[agentId] || !message) return;
-  agents[agentId].progress.push({
+  const normalizedAgentId = normalizeAgentId(agentId);
+  if (!message) return;
+  agents[normalizedAgentId].progress.push({
     id: crypto.randomUUID(),
     message,
   });
-  agents[agentId].status = "streaming";
-  agents[agentId].updatedAt = new Date().toLocaleTimeString();
+  agents[normalizedAgentId].status = "streaming";
+  agents[normalizedAgentId].updatedAt = new Date().toLocaleTimeString();
   scrollToLatest();
 }
 
@@ -291,8 +384,8 @@ function isLatestProgress(agentId, progressId) {
 function finishPendingAgents() {
   for (const definition of agentDefinitions) {
     const panel = agents[definition.id];
-    if (panel.status === "waiting" || panel.status === "streaming") {
-      panel.status = currentBlocks.value.length || panel.progress.length ? "done" : "idle";
+    if (panel.status === "streaming") {
+      panel.status = panel.blocks.length || panel.progress.length ? "done" : "idle";
       panel.updatedAt = panel.updatedAt || new Date().toLocaleTimeString();
     }
   }
@@ -338,11 +431,11 @@ async function copyTextContent(content, copyKey) {
 }
 
 async function copyAgentReply(agentId) {
-  if (!agents[agentId]) return;
-  const content = blocksTextContent(currentBlocks.value);
+  const normalizedAgentId = normalizeAgentId(agentId);
+  const content = blocksTextContent(agents[normalizedAgentId].blocks);
   if (!content) return;
 
-  await copyTextContent(content, agentId);
+  await copyTextContent(content, normalizedAgentId);
 }
 
 async function runAnalysis() {
@@ -352,7 +445,7 @@ async function runAnalysis() {
   archiveCurrentTurn();
   abortRunRequest();
   resetAgentPanels();
-  currentBlocks.value = [];
+  activeAgentId.value = "fundamental";
   renderedToolCallIds = new Set();
   errorMessage.value = "";
   runPhase.value = "starting";
@@ -367,7 +460,7 @@ async function runAnalysis() {
   let streamCompleted = false;
 
   try {
-    await fetchEventSource("/api/run/fundamental/stream", {
+    await fetchEventSource("/api/run/agents/stream", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -376,7 +469,7 @@ async function runAnalysis() {
       body: JSON.stringify({
         command: prompt,
         timeout_seconds: 1800,
-        agent_mode: "fundamental",
+        agent_mode: "all",
         conversation_id: conversationId,
       }),
       signal: controller.signal,
@@ -390,7 +483,15 @@ async function runAnalysis() {
         runPhase.value = "connected";
       },
       onmessage(event) {
-        const data = event.data ? JSON.parse(event.data) : {};
+        let data = {};
+        try {
+          data = event.data ? JSON.parse(event.data) : {};
+        } catch (error) {
+          errorMessage.value = "收到一条无法解析的 SSE 消息，已跳过。";
+          return;
+        }
+
+        const agentId = normalizeAgentId(data.agent || "fundamental");
 
         if (event.event === "status") {
           runPhase.value = data.message || "running";
@@ -398,22 +499,22 @@ async function runAnalysis() {
         }
 
         if (event.event === "agent_status") {
-          setAgentStatus(data.agent || "fundamental", data.status || "streaming");
+          setAgentStatus(agentId, data.status || "streaming");
           return;
         }
 
         if (event.event === "agent_progress") {
-          appendAgentProgress(data.agent || "fundamental", data.message || "");
+          appendAgentProgress(agentId, data.message || "");
           return;
         }
 
-        if (event.event === "token") {
-          appendAgentContent(data.agent || "fundamental", data.content || "");
+        if (event.event === "token" || event.event === "agent_delta") {
+          appendAgentContent(agentId, data.content || "");
           return;
         }
 
         if (event.event === "kline") {
-          appendKlineBlock(data);
+          appendKlineBlock(agentId, data);
           return;
         }
 
@@ -422,7 +523,13 @@ async function runAnalysis() {
         }
 
         if (event.event === "kline_error") {
-          appendKlineErrorBlock(data.message, data);
+          appendKlineErrorBlock(agentId, data.message, data);
+          return;
+        }
+
+        if (event.event === "agent_error") {
+          setAgentStatus(agentId, "error");
+          appendAgentProgress(agentId, data.message || "Agent 执行失败。");
           return;
         }
 
@@ -431,10 +538,9 @@ async function runAnalysis() {
           isRunning.value = false;
           runPhase.value = "failed";
           updateActiveConversationStatus("failed");
-          for (const definition of agentDefinitions) {
-            if (agents[definition.id].status !== "done") {
-              agents[definition.id].status = "error";
-            }
+          const failedAgentId = normalizeAgentId(data.agent || "fundamental");
+          if (agents[failedAgentId].status !== "done") {
+            agents[failedAgentId].status = "error";
           }
           streamCompleted = true;
           throw new Error(errorMessage.value);
@@ -469,10 +575,8 @@ async function runAnalysis() {
         isRunning.value = false;
         runPhase.value = "failed";
         updateActiveConversationStatus("failed");
-        for (const definition of agentDefinitions) {
-          if (agents[definition.id].status !== "done") {
-            agents[definition.id].status = "error";
-          }
+        if (agents.fundamental.status !== "done") {
+          agents.fundamental.status = "error";
         }
         if (runAbortController === controller) {
           runAbortController = null;
@@ -620,25 +724,55 @@ onBeforeUnmount(() => {
           </div>
         </section>
 
-        <section class="agent-grid">
-          <article
+        <section v-if="shouldShowAgentWorkspace" class="agent-workspace">
+          <div class="agent-switcher" role="tablist" aria-label="Agent 输出切换">
+            <button
             v-for="definition in agentDefinitions"
             :key="definition.id"
-            class="agent-card"
-            :class="definition.accent"
+              class="agent-switch-card"
+              :class="[
+                definition.accent,
+                { active: activeAgentId === definition.id },
+              ]"
+              type="button"
+              role="tab"
+              :aria-selected="activeAgentId === definition.id"
+              @click="activeAgentId = definition.id"
           >
-            <div class="agent-card-head">
-              <div class="flex min-w-0 items-center gap-2">
+              <div class="agent-switch-head">
                 <span class="badge badge-sm" :class="definition.tone"></span>
-                <h2 class="truncate text-base font-bold">{{ definition.name }}</h2>
+                <span class="agent-switch-name">{{ definition.name }}</span>
+                <span class="badge badge-sm gap-1" :class="statusClass(agents[definition.id].status)">
+                  <component
+                    :is="statusIcon(agents[definition.id].status)"
+                    :class="{ spin: agents[definition.id].status === 'streaming' }"
+                    :size="12"
+                  />
+                  {{ statusLabel(agents[definition.id].status) }}
+                </span>
               </div>
-              <div class="badge gap-1" :class="statusClass(agents[definition.id].status)">
+              <div class="agent-switch-progress">
+                {{ agentStatusSummary(definition.id) }}
+              </div>
+              <div class="agent-switch-time">
+                {{ agents[definition.id].updatedAt || "未更新" }}
+              </div>
+            </button>
+          </div>
+
+          <article class="agent-workspace-panel" :class="activeAgentDefinition.accent">
+            <div class="agent-workspace-header">
+              <div class="flex min-w-0 items-center gap-2">
+                <span class="badge badge-sm" :class="activeAgentDefinition.tone"></span>
+                <h2 class="truncate text-base font-bold">{{ activeAgentDefinition.fullName }}</h2>
+              </div>
+              <div class="badge gap-1" :class="statusClass(activeAgentState.status)">
                 <component
-                  :is="statusIcon(agents[definition.id].status)"
-                  :class="{ spin: agents[definition.id].status === 'streaming' }"
+                  :is="statusIcon(activeAgentState.status)"
+                  :class="{ spin: activeAgentState.status === 'streaming' }"
                   :size="13"
                 />
-                {{ statusLabel(agents[definition.id].status) }}
+                {{ statusLabel(activeAgentState.status) }}
               </div>
             </div>
 
@@ -646,22 +780,22 @@ onBeforeUnmount(() => {
               class="agent-response-card"
               :class="{
                 'agent-response-card-empty':
-                  !agents[definition.id].progress.length &&
-                  !currentBlocks.length,
+                  !activeAgentState.progress.length &&
+                  !activeAgentState.blocks.length,
               }"
             >
               <div class="agent-output">
-                <div v-if="agents[definition.id].progress.length" class="agent-progress-list">
+                <div v-if="activeAgentState.progress.length" class="agent-progress-list">
                   <div
-                    v-for="item in agents[definition.id].progress"
+                    v-for="item in activeAgentState.progress"
                     :key="item.id"
                     class="agent-progress-line"
                   >
                     <span>{{ item.message }}</span>
                     <LoaderCircle
                       v-if="
-                        agents[definition.id].status === 'streaming' &&
-                        isLatestProgress(definition.id, item.id)
+                        activeAgentState.status === 'streaming' &&
+                        isLatestProgress(activeAgentId, item.id)
                       "
                       class="spin"
                       :size="14"
@@ -669,7 +803,7 @@ onBeforeUnmount(() => {
                   </div>
                 </div>
 
-                <template v-for="block in currentBlocks" :key="block.id">
+                <template v-for="block in activeAgentState.blocks" :key="block.id">
                   <div v-if="block.type === 'text'" class="agent-final-frame">
                     <div
                       class="agent-final markdown-body"
@@ -680,9 +814,9 @@ onBeforeUnmount(() => {
                       type="button"
                       title="复制回复"
                       aria-label="复制回复"
-                      @click="copyAgentReply(definition.id)"
+                      @click="copyAgentReply(activeAgentId)"
                     >
-                      <Check v-if="copiedAgentId === definition.id" :size="16" />
+                      <Check v-if="copiedAgentId === activeAgentId" :size="16" />
                       <Copy v-else :size="16" />
                     </button>
                   </div>
@@ -700,16 +834,16 @@ onBeforeUnmount(() => {
 
                 <div
                   v-if="
-                    !agents[definition.id].progress.length &&
-                    !currentBlocks.length
+                    !activeAgentState.progress.length &&
+                    !activeAgentState.blocks.length
                   "
                   class="agent-empty"
                 >
-                  等待输出
+                  {{ activeAgentEmptyText() }}
                 </div>
                 <div class="output-sentinel"></div>
                 <div class="agent-response-time">
-                  {{ agents[definition.id].updatedAt || "未更新" }}
+                  {{ activeAgentState.updatedAt || "未更新" }}
                 </div>
               </div>
             </div>

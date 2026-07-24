@@ -4,7 +4,7 @@ TechnicalAnalysis Agent: Performs technical analysis of a stock using ReAct Agen
 """
 import os
 import json
-from typing import Dict, Any, List, Optional
+from typing import AsyncIterator, Dict, Any, List, Optional
 from datetime import datetime, timedelta
 from langchain_core.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI
@@ -18,6 +18,7 @@ from src.utils.state_definition import AgentState
 from src.tools.mcp_client import get_mcp_tools
 from src.utils.logging_config import setup_logger, ERROR_ICON, SUCCESS_ICON, WAIT_ICON
 from src.utils.execution_logger import get_execution_logger
+from src.agents.streaming_utils import stream_react_agent_chunks
 from dotenv import load_dotenv
 
 # 从.env文件加载环境变量
@@ -29,6 +30,11 @@ TECHNICAL_TOOL_NAMES = frozenset({
     "get_stock_basic_info",
     "get_historical_k_data",
 })
+
+TECHNICAL_PROGRESS_MESSAGES = {
+    "get_stock_basic_info": "正在获取公司基本信息。",
+    "get_historical_k_data": "正在获取历史 K 线和价量数据。",
+}
 
 
 def _safe_kline_date(value: str) -> str:
@@ -59,6 +65,260 @@ def _normalize_kline_tool_code(stock_code: str) -> str:
     if digits.startswith(("0", "3")):
         return f"sz.{digits}"
     return digits
+
+
+async def stream_technical_agent(state: AgentState) -> AsyncIterator[dict[str, Any]]:
+    """Stream real LLM chunks from the technical ReAct agent."""
+    logger.info(f"{WAIT_ICON} TechnicalAgent: Starting streaming technical analysis.")
+    load_dotenv(override=True)
+
+    execution_logger = get_execution_logger()
+    agent_name = "technical_agent"
+    agent_id = "technical"
+
+    current_data = state.get("data", {})
+    current_metadata = state.get("metadata", {})
+    user_query = current_data.get("query")
+
+    execution_logger.log_agent_start(agent_name, {
+        "user_query": user_query,
+        "stock_code": current_data.get("stock_code"),
+        "company_name": current_data.get("company_name"),
+        "input_data_keys": list(current_data.keys()),
+        "streaming": True,
+    })
+
+    if not user_query:
+        current_data["technical_analysis_error"] = "User query is missing."
+        execution_logger.log_agent_complete(agent_name, current_data, 0, False, "User query is missing")
+        raise ValueError("User query is missing.")
+
+    agent_start_time = time.time()
+
+    try:
+        api_key = os.getenv("OPENAI_COMPATIBLE_API_KEY")
+        base_url = os.getenv("OPENAI_COMPATIBLE_BASE_URL")
+        model_name = os.getenv("OPENAI_COMPATIBLE_MODEL")
+
+        if not all([api_key, base_url, model_name]):
+            current_data["technical_analysis_error"] = "Missing OpenAI environment variables."
+            execution_logger.log_agent_complete(
+                agent_name,
+                current_data,
+                time.time() - agent_start_time,
+                False,
+                "Missing OpenAI environment variables",
+            )
+            raise RuntimeError("Missing OpenAI environment variables.")
+
+        yield {
+            "event": "agent_progress",
+            "data": {"agent": agent_id, "message": "正在连接技术面数据工具..."},
+        }
+
+        llm = ChatOpenAI(
+            model=model_name,
+            api_key=api_key,
+            base_url=base_url,
+            temperature=0.3,
+            max_tokens=6000,
+            streaming=True,
+        )
+
+        async with get_mcp_tools() as all_mcp_tools:
+            mcp_tools = [
+                tool
+                for tool in all_mcp_tools
+                if tool.name in TECHNICAL_TOOL_NAMES
+            ]
+
+            loaded_names = {tool.name for tool in mcp_tools}
+            missing_names = TECHNICAL_TOOL_NAMES - loaded_names
+            if missing_names:
+                raise RuntimeError(f"TechnicalAgent 缺少 MCP 工具: {sorted(missing_names)}")
+            if not mcp_tools:
+                raise RuntimeError("No MCP tools available.")
+
+            yield {
+                "event": "agent_progress",
+                "data": {"agent": agent_id, "message": "已加载技术面分析工具。"},
+            }
+
+            agent = create_react_agent(llm, mcp_tools)
+
+            stock_code = current_data.get("stock_code", "Unknown")
+            company_name = current_data.get("company_name", "Unknown")
+            current_time_info = current_data.get("current_time_info", "未知时间")
+            current_date = current_data.get("current_date", "未知日期")
+
+            kline_tool = next(tool for tool in mcp_tools if tool.name == "get_historical_k_data")
+            kline_end_date = _safe_kline_date(current_date)
+            kline_start_date = (
+                datetime.strptime(kline_end_date, "%Y-%m-%d") - timedelta(days=240)
+            ).strftime("%Y-%m-%d")
+            mandatory_kline_args = {
+                "code": _normalize_kline_tool_code(stock_code),
+                "start_date": kline_start_date,
+                "end_date": kline_end_date,
+                "frequency": "d",
+                "adjust_flag": "3",
+                "fields": [
+                    "date",
+                    "code",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                    "amount",
+                    "pctChg",
+                ],
+            }
+
+            yield {
+                "event": "agent_progress",
+                "data": {"agent": agent_id, "message": "正在预取技术分析所需 K 线数据。"},
+            }
+
+            mandatory_kline_result = ""
+            try:
+                mandatory_kline_result = await kline_tool.ainvoke(mandatory_kline_args)
+                current_data["mandatory_kline_tool_used"] = True
+                current_data["mandatory_kline_tool_args"] = mandatory_kline_args
+                current_data["mandatory_kline_tool_preview"] = _compact_tool_result(
+                    mandatory_kline_result,
+                    2000,
+                )
+                logger.info("TechnicalAgent mandatory get_historical_k_data call completed.")
+            except Exception as exc:
+                current_data["mandatory_kline_tool_used"] = False
+                current_data["mandatory_kline_tool_error"] = str(exc)
+                mandatory_kline_result = f"Error calling get_historical_k_data: {exc}"
+                logger.error(
+                    "TechnicalAgent mandatory get_historical_k_data call failed: %s",
+                    exc,
+                    exc_info=True,
+                )
+
+            agent_input = f"""请分析{company_name}（股票代码：{stock_code}）的技术指标。
+
+当前时间：{current_time_info}
+当前日期：{current_date}
+
+MANDATORY K-LINE TOOL CALL:
+- The technical agent MUST use get_historical_k_data for this stock.
+- A mandatory get_historical_k_data call has already been executed with:
+  {json.dumps(mandatory_kline_args, ensure_ascii=False)}
+- You must base the K-line and price-volume part of the analysis on this actual tool result.
+- If the tool result contains an error, clearly state that K-line data could not be retrieved and do not fabricate prices.
+- Include a short line in your final answer: KLINE_TOOL_USED: {"yes" if current_data.get("mandatory_kline_tool_used") else "no"}
+
+MANDATORY K-LINE TOOL RESULT:
+{_compact_tool_result(mandatory_kline_result)}
+
+请进行以下技术分析：
+1. 获取股票基本信息和最新价格
+2. 获取历史K线数据（建议获取最近3-6个月的数据）
+3. 分析价格趋势和技术形态
+4. 分析成交量变化
+5. 计算和分析主要技术指标（如移动平均线、MACD、RSI等）
+6. 识别支撑位和阻力位
+7. 提供技术面总结和短期走势判断
+
+重要限制：请专注于价格数据和技术指标分析，不要使用crawl_news工具获取新闻信息。技术分析应该基于价格走势、成交量和技术指标数据，而不是新闻事件。
+
+请使用可用的工具获取实际数据进行分析，而不是基于假设。"""
+
+            logger.info(f"Agent input: {agent_input}")
+            input_data = {"messages": [HumanMessage(content=agent_input)]}
+
+            yield {
+                "event": "agent_status",
+                "data": {"agent": agent_id, "status": "streaming"},
+            }
+            yield {
+                "event": "status",
+                "data": {"message": "正在执行技术面分析。", "agent": agent_id},
+            }
+
+            start_time = time.time()
+            streamed_parts: list[str] = []
+            async for event in stream_react_agent_chunks(
+                agent,
+                input_data,
+                agent_id=agent_id,
+                streamed_parts=streamed_parts,
+                tool_progress_messages=TECHNICAL_PROGRESS_MESSAGES,
+            ):
+                yield event
+
+        execution_time = time.time() - start_time
+        final_output = "".join(streamed_parts).strip()
+        if not final_output:
+            raise RuntimeError("No streamed technical analysis generated.")
+
+        print("::agent-output-start technical", flush=True)
+        print(final_output, flush=True)
+        print("::agent-output-end technical", flush=True)
+
+        execution_logger.log_llm_interaction(
+            agent_name=agent_name,
+            interaction_type="react_agent_stream",
+            input_messages=[{"role": "user", "content": agent_input}],
+            output_content=final_output,
+            model_config={
+                "model": model_name,
+                "temperature": 0.3,
+                "max_tokens": 6000,
+                "api_base": base_url,
+                "streaming": True,
+            },
+            execution_time=execution_time,
+        )
+
+        current_data["technical_analysis"] = final_output
+        current_metadata["technical_agent_executed"] = True
+        current_metadata["technical_agent_timestamp"] = str(time.time())
+        current_metadata["technical_agent_execution_time"] = f"{execution_time:.2f} seconds"
+
+        total_execution_time = time.time() - agent_start_time
+        execution_logger.log_agent_complete(
+            agent_name,
+            {
+                "technical_analysis_length": len(final_output),
+                "analysis_preview": final_output[:500],
+                "llm_execution_time": execution_time,
+                "total_execution_time": total_execution_time,
+                "streamed": True,
+            },
+            total_execution_time,
+            True,
+        )
+
+        yield {
+            "event": "final",
+            "data": {"agent": agent_id, "content": final_output},
+        }
+        yield {
+            "event": "agent_status",
+            "data": {"agent": agent_id, "status": "done"},
+        }
+
+    except Exception as e:
+        logger.error(
+            f"{ERROR_ICON} TechnicalAgent: Streaming execution failed: {e}",
+            exc_info=True,
+        )
+        current_data["technical_analysis_error"] = str(e)
+        current_metadata["technical_agent_error"] = str(e)
+        execution_logger.log_agent_complete(
+            agent_name,
+            current_data,
+            time.time() - agent_start_time,
+            False,
+            str(e),
+        )
+        raise
 
 
 async def technical_agent(state: AgentState) -> AgentState:
